@@ -144,6 +144,24 @@ local CONFIG = {
     LabelSize          = 14,
 }
 
+-- settings from the loader: set _G.TrajectoryConfig = { ... } before loadstring to override any of the above
+-- e.g.  _G.TrajectoryConfig = { Debug = false, LogThrows = false, TopViewRange = 60 }
+do
+    local user = _G.TrajectoryConfig
+    if type(user) == "table" then
+        local n = 0
+        for k, v in pairs(user) do
+            if CONFIG[k] ~= nil or k == "GroundY" then
+                CONFIG[k] = v
+                n = n + 1
+            else
+                print("[Trajectory] unknown setting in TrajectoryConfig: " .. tostring(k))
+            end
+        end
+        print("[Trajectory] applied " .. n .. " setting(s) from _G.TrajectoryConfig")
+    end
+end
+
 -- defaults, so R can undo calibration
 local DEFAULTS = {}
 for _, k in ipairs({ "ThrowSpeed", "Gravity", "UpBias", "OriginShift", "SpawnOffset", "LaunchFrom",
