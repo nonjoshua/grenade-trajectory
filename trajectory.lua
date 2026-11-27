@@ -56,11 +56,14 @@ local CONFIG = {
     WallSlideKeep      = 0.6,    -- share of speed ALONG the wall that is kept (fitted to your logged wall hit)
 
     -- fuse: the grenade explodes this long after you release it (it hangs ~0.15s before flying)
-    Fuse               = 3,
+    Fuse               = 2.56,   -- measured: 2.53-2.63s on 3 throws (median 2.56). Updated from real explosions (FuseFromGame)
     FuseStart          = "Throw", -- "Throw" = counts from release; "Pin" = counts from pulling the pin (cooking)
     LaunchDelay        = 0.15,   -- seconds it hangs in front of you before it starts flying
     ColorAirburst      = Color3.fromRGB(180, 100, 255), -- explodes in the air before landing
     ColorRolling       = Color3.fromRGB(80, 220, 220),  -- explodes while still rolling
+    FuseWarnMargin     = 0.4,    -- warn when it lands with less than this many seconds of fuse left
+    ColorFuseRisk      = Color3.fromRGB(255, 130, 30),  -- lands only just before the fuse runs out: may airburst
+    FuseFromGame       = true,   -- time real grenades from release to explosion and use that as the fuse
 
     -- depth cues on the 3D arc: crossbars every TickSeconds (wide up close, small far away)
     ArcTicks           = true,
@@ -72,10 +75,20 @@ local CONFIG = {
     InBlastColor       = Color3.fromRGB(255, 120, 255),
     InBlastScanHz      = 2,      -- how often the list of humanoids is refreshed (positions update every frame)
     InBlastMax         = 8,      -- most names shown
+    -- predict where people will be when the grenade explodes (straight-line from their current movement)
+    PredictMovement    = true,
+    PredictWindow      = 0.4,    -- seconds of movement used to estimate their speed/direction
+    PredictMaxStuds    = 60,     -- never predict further than this (teleports, glitches)
+    -- target check: the person nearest the blast (where they'll be when it explodes) is the target
+    TargetCheck        = true,
+    TargetMaxDistance  = 40,     -- studs beyond the blast edge to still count someone as the target
+    ColorHit           = Color3.fromRGB(80, 255, 120),  -- the target will be hit
+    ColorMiss          = Color3.fromRGB(255, 60, 60),   -- the target will NOT be hit
     InBlastHud         = true,   -- show the names at a fixed spot on screen (not attached to the landing spot)
     BlastNeedsLineOfSight = true, -- walls/roofs/floors between the blast and a person shield them
     CoverColor         = Color3.fromRGB(150, 150, 150),
     InBlastHudPos      = Vector2.new(0.5, 0.58), -- where, as a fraction of the screen (0.5, 0.58 = just below the crosshair)
+    TargetHudPos       = Vector2.new(0.5, 0.53), -- where the target line (HIT / WILL MISS) is shown
     LaunchFrom         = "Head", -- "Head", "Hand", "Camera" or "Root": the spot the arc is anchored to.
                                  -- Head is steady; Hand moves with the wind-up animation (calibration never changes this)
     ResetKey           = 0x52,   -- R: throw away all calibration and go back to the defaults above
@@ -103,9 +116,13 @@ local CONFIG = {
     Steps              = 50,
     TimeStep           = 0.06,
 
-    -- performance limiter
+    -- performance limiter (or pick a preset in the settings menu: RightShift)
     PhysicsHz          = 20,     -- how often the arc is re-simulated (raycasts); drawing stays every frame
     DrawHz             = 60,     -- how often lines are re-projected to the screen (0 = every frame)
+    PanelHz            = 30,     -- how often the side view / top view are redrawn
+    SideColumns        = 80,     -- side view detail (slices through buildings): fewer = faster
+    MenuKey            = 0xA1,   -- Right Shift: open / close the settings menu
+    SaveFile           = "grenade-trajectory-settings.txt", -- settings are saved here (if the executor has writefile)
     LogHz              = 20,     -- flight-log samples per second
     AimDistance        = 60,
     FallbackGroundDrop = 3,
@@ -144,6 +161,7 @@ local CONFIG = {
     LabelSize          = 14,
 }
 
+-- (saved settings from the menu are loaded further down, once the helpers exist)
 -- settings from the loader: set _G.TrajectoryConfig = { ... } before loadstring to override any of the above
 -- e.g.  _G.TrajectoryConfig = { Debug = false, LogThrows = false, TopViewRange = 60 }
 do
@@ -188,6 +206,42 @@ end
 
 local now = (os and os.clock) or tick
 
+-- Drawing objects behind a small cache: a property is only sent to the executor when its value
+-- actually changes (re-hiding already-hidden lines every frame was most of the drawing work)
+local function newDrawing(kind)
+    local real = Drawing.new(kind)
+    local shadow = {}
+    local proxy = {}
+    local function remove() pcall(function() real:Remove() end) end
+    return setmetatable(proxy, {
+        __index = function(_, k)
+            if k == "Remove" then return remove end
+            local v = shadow[k]
+            if v ~= nil then return v end
+            return real[k]
+        end,
+        __newindex = function(_, k, v)
+            if shadow[k] ~= v then
+                shadow[k] = v
+                real[k] = v
+            end
+        end,
+    })
+end
+
+-- rate limiter: returns true at most hz times per second (hz <= 0 means always)
+local lastTick = {}
+local function due(key, hz)
+    if not hz or hz <= 0 then return true end
+    local t = now()
+    if not lastTick[key] or t - lastTick[key] >= 1 / hz then
+        lastTick[key] = t
+        return true
+    end
+    return false
+end
+
+
 -- ---------- helpers ----------
 local function v3(x, y, z) return Vector3.new(x, y, z) end
 local function clamp(x, lo, hi) if x < lo then return lo elseif x > hi then return hi end return x end
@@ -226,68 +280,72 @@ end
 local MAX_LINES = CONFIG.Steps
 local lines = {}
 for i = 1, MAX_LINES do
-    local l = Drawing.new("Line")
+    local l = newDrawing("Line")
     l.Color, l.Thickness, l.Transparency, l.Visible = CONFIG.Color, CONFIG.Thickness, 1, false
     lines[i] = l
 end
 local bounceDots = {}
 for i = 1, 3 do
-    local c = Drawing.new("Circle")
+    local c = newDrawing("Circle")
     c.Color, c.Thickness, c.Filled, c.NumSides, c.Radius, c.Transparency, c.Visible = CONFIG.RollColor, 2, false, 12, 5, 1, false
     bounceDots[i] = c
 end
 local ticks = {}
 for i = 1, 24 do
-    local l = Drawing.new("Line")
+    local l = newDrawing("Line")
     l.Color, l.Thickness, l.Transparency, l.Visible = CONFIG.Color, 2, 1, false
     ticks[i] = l
 end
 local blastRing = {}
-for i = 1, CONFIG.BlastSegments do
-    local l = Drawing.new("Line")
+for i = 1, 40 do -- room for the max setting; CONFIG.BlastSegments decides how many are used
+    local l = newDrawing("Line")
     l.Thickness, l.Transparency, l.Visible = 2, 1, false
     blastRing[i] = l
 end
 local inBlastMarks = {}
 for i = 1, CONFIG.InBlastMax do
-    local c = Drawing.new("Circle")
+    local c = newDrawing("Circle")
     c.Color, c.Thickness, c.Filled, c.NumSides, c.Transparency, c.Visible = CONFIG.InBlastColor, 2, false, 16, 1, false
     inBlastMarks[i] = c
 end
-local inBlastText = Drawing.new("Text")
+local inBlastText = newDrawing("Text")
 inBlastText.Size, inBlastText.Center, inBlastText.Outline, inBlastText.Color, inBlastText.Visible =
     CONFIG.LabelSize + 4, true, true, CONFIG.InBlastColor, false
-local status = Drawing.new("Text")
+local targetText = newDrawing("Text")
+targetText.Size, targetText.Center, targetText.Outline, targetText.Visible = CONFIG.LabelSize + 6, true, true, false
+local targetLine = newDrawing("Line")
+targetLine.Thickness, targetLine.Transparency, targetLine.Visible = 2, 1, false
+local status = newDrawing("Text")
 status.Size, status.Center, status.Outline, status.Visible = CONFIG.LabelSize, true, true, false
-local marker = Drawing.new("Circle")
+local marker = newDrawing("Circle")
 marker.Color, marker.Thickness, marker.Filled = CONFIG.LandColor, 2, false
 marker.NumSides, marker.Transparency, marker.Visible = CONFIG.MarkerSides, 1, false
-local rollLine = Drawing.new("Line")
+local rollLine = newDrawing("Line")
 rollLine.Color, rollLine.Thickness, rollLine.Transparency, rollLine.Visible = CONFIG.RollColor, CONFIG.Thickness, 1, false
-local impactDot = Drawing.new("Circle")
+local impactDot = newDrawing("Circle")
 impactDot.Color, impactDot.Thickness, impactDot.Filled = CONFIG.Color, 2, true
 impactDot.NumSides, impactDot.Radius, impactDot.Transparency, impactDot.Visible = 12, 4, 1, false
 local panel = { lines = {}, cols = {}, bg = nil, ground = nil, title = nil }
-if CONFIG.SidePanel then
-    panel.bg = Drawing.new("Square")
+do -- (always created, so the panel can be switched on from the settings menu)
+    panel.bg = newDrawing("Square")
     panel.bg.Filled, panel.bg.Color, panel.bg.Transparency, panel.bg.Visible = true, Color3.fromRGB(15, 15, 20), 0.55, false
-    panel.title = Drawing.new("Text")
+    panel.title = newDrawing("Text")
     panel.title.Size, panel.title.Color, panel.title.Outline, panel.title.Visible = 13, Color3.fromRGB(230, 230, 230), true, false
     for i = 1, MAX_LINES do
-        local l = Drawing.new("Line")
+        local l = newDrawing("Line")
         l.Color, l.Thickness, l.Transparency, l.Visible = CONFIG.Color, 2, 1, false
         panel.lines[i] = l
     end
     for i = 1, 160 do
-        local l = Drawing.new("Line")
+        local l = newDrawing("Line")
         l.Color, l.Thickness, l.Transparency, l.Visible = Color3.fromRGB(150, 150, 150), 2, 1, false
         panel.cols[i] = l
     end
-    panel.ground = Drawing.new("Line")
+    panel.ground = newDrawing("Line")
     panel.ground.Color, panel.ground.Thickness, panel.ground.Transparency, panel.ground.Visible = Color3.fromRGB(90, 160, 90), 1, 1, false
-    panel.blast = Drawing.new("Line")
+    panel.blast = newDrawing("Line")
     panel.blast.Thickness, panel.blast.Transparency, panel.blast.Visible = 4, 0.8, false
-    panel.land = Drawing.new("Circle")
+    panel.land = newDrawing("Circle")
     panel.land.Color, panel.land.Radius, panel.land.Filled, panel.land.Transparency, panel.land.Visible = CONFIG.LandColor, 4, true, 1, false
 end
 local function hidePanel()
@@ -303,30 +361,30 @@ local function removePanel()
     for _, l in ipairs(panel.lines) do l:Remove() end
     for _, l in ipairs(panel.cols) do l:Remove() end
 end
-local label = Drawing.new("Text")
+local label = newDrawing("Text")
 label.Color, label.Size, label.Center, label.Outline, label.Visible = CONFIG.LandColor, CONFIG.LabelSize, true, true, false
 
 -- ---------- top-down panel objects ----------
 local top = { boxLines = {}, arc = {}, people = {}, names = {}, bounces = {} }
-if CONFIG.TopPanel then
+do -- (always created, so the top view can be switched on from the settings menu)
     local function newLine(color, th)
-        local l = Drawing.new("Line")
+        local l = newDrawing("Line")
         l.Color, l.Thickness, l.Transparency, l.Visible = color, th or 1, 1, false
         return l
     end
     local function newCircle(color, r, filled)
-        local c = Drawing.new("Circle")
+        local c = newDrawing("Circle")
         c.Color, c.Radius, c.Filled, c.Thickness, c.NumSides, c.Transparency, c.Visible = color, r, filled, 2, 24, 1, false
         return c
     end
-    top.bg = Drawing.new("Square")
+    top.bg = newDrawing("Square")
     top.bg.Filled, top.bg.Color, top.bg.Transparency, top.bg.Visible = true, Color3.fromRGB(15, 15, 20), 0.6, false
-    top.border = Drawing.new("Square")
+    top.border = newDrawing("Square")
     top.border.Filled, top.border.Color, top.border.Thickness, top.border.Transparency, top.border.Visible =
         false, Color3.fromRGB(120, 120, 130), 1, 1, false
-    top.title = Drawing.new("Text")
+    top.title = newDrawing("Text")
     top.title.Size, top.title.Color, top.title.Outline, top.title.Visible = 13, Color3.fromRGB(230, 230, 230), true, false
-    for i = 1, CONFIG.TopMaxBoxes * 4 do top.boxLines[i] = newLine(CONFIG.TopColorLow, 1) end
+    for i = 1, 70 * 4 do top.boxLines[i] = newLine(CONFIG.TopColorLow, 1) end -- room for the max setting
     for i = 1, 40 do top.arc[i] = newLine(CONFIG.Color, 2) end
     top.roll = newLine(CONFIG.RollColor, 2)
     top.ring = newCircle(CONFIG.ColorClear, 10, false)
@@ -334,9 +392,15 @@ if CONFIG.TopPanel then
     top.impact = newCircle(CONFIG.Color, 3, true)
     top.me = newCircle(Color3.fromRGB(90, 170, 255), 4, true)
     for i = 1, 3 do top.bounces[i] = newCircle(CONFIG.RollColor, 3, false) end
+    top.targetLine = newLine(CONFIG.ColorMiss, 2)
+    top.predLines, top.predRings = {}, {}
+    for i = 1, 14 do
+        top.predLines[i] = newLine(Color3.fromRGB(255, 255, 255), 1)
+        top.predRings[i] = newCircle(Color3.fromRGB(255, 255, 255), 4, false)
+    end
     for i = 1, 14 do
         top.people[i] = newCircle(Color3.fromRGB(255, 255, 255), 3, true)
-        local t = Drawing.new("Text")
+        local t = newDrawing("Text")
         t.Size, t.Outline, t.Center, t.Visible = 12, true, false, false
         top.names[i] = t
     end
@@ -349,6 +413,9 @@ local function topAll(fn)
     for _, c in ipairs(top.people) do fn(c) end
     for _, t in ipairs(top.names) do fn(t) end
     for _, c in ipairs(top.bounces) do fn(c) end
+    for _, l in ipairs(top.predLines or {}) do fn(l) end
+    if top.targetLine then fn(top.targetLine) end
+    for _, c in ipairs(top.predRings or {}) do fn(c) end
 end
 local function hideTop() topAll(function(o) o.Visible = false end) end
 
@@ -362,6 +429,7 @@ local function hideAll()
     status.Visible = false
     for _, c in ipairs(inBlastMarks) do c.Visible = false end
     inBlastText.Visible = false
+    targetText.Visible, targetLine.Visible = false, false
     hidePanel()
     hideTop()
 end
@@ -632,12 +700,12 @@ local function castSegment(from, to, char, groundY)
         if p then return p end
     elseif CONFIG.MapCollision then
         local p, isFloor, normal = mapHit(from, to)
-        if p then return p, isFloor, normal end
+        if p then return p, isFloor, normal, "map part" end
     end
     -- flat floor under the player: the only collision without Raycast, and a safety net with it
     if to.Y <= groundY and from.Y > groundY then
         local t = (from.Y - groundY) / (from.Y - to.Y)
-        return from + (to - from) * t
+        return from + (to - from) * t, true, nil, "flat fallback floor (no map part there)"
     end
     return nil
 end
@@ -708,6 +776,7 @@ local arcPts, arcLand, arcRoot, arcRest = {}, nil, nil, nil
 local arcFloor = true
 local arcAir, arcRollBurst, arcTimes, arcTickPts, arcAirHeight = nil, false, {}, {}, nil
 local arcBounces = {}
+local arcLandSrc = nil
 local arcProfile = nil
 
 local function simulate(camera, char)
@@ -745,6 +814,7 @@ local function simulate(camera, char)
     local tPrev, tHit, airburst = 0, nil, nil -- tPrev: time since the current parabola started
     local bounces, bouncePts = 0, {}
     local vImpact = vel
+    local landSrc = nil
     local dt = CONFIG.TimeStep
     local function segAt(s, tau) return s.o + s.v * tau + v3(0, -0.5 * g * tau * tau, 0) end
     for _ = 1, CONFIG.Steps * 2 do
@@ -752,8 +822,9 @@ local function simulate(camera, char)
         local cut = false
         if cur.t0 + tau >= flightBudget then tau, cut = math.max(flightBudget - cur.t0, 0), true end
         local nextPos = segAt(cur, tau)
-        local hitPos, isFloor, normal = castSegment(pos, nextPos, char, groundY)
+        local hitPos, isFloor, normal, hitSrc = castSegment(pos, nextPos, char, groundY)
         if hitPos then
+            landSrc = hitSrc
             local seg = (nextPos - pos).Magnitude
             local frac = seg > 0 and (hitPos - pos).Magnitude / seg or 1
             local tauHit = tPrev + (tau - tPrev) * frac
@@ -809,6 +880,7 @@ local function simulate(camera, char)
     end
     arcPts, arcLand, arcRoot, arcRest = pts, landPos, root and root.Position, restPos
     arcAir, arcRollBurst = airburst, rollBurst
+    arcLandSrc = landSrc
     arcAirHeight = nil
     if airburst then
         local below = mapHit(airburst, airburst - v3(0, 2000, 0))
@@ -831,7 +903,7 @@ local function simulate(camera, char)
     arcFloor = landFloor
 
     -- side profile for the panel: distance along the throw vs height, plus buildings cut on that line
-    if CONFIG.SidePanel then
+    if CONFIG.SidePanel and due("sideProfile", CONFIG.PanelHz) then
         local o, last = pts[1], pts[#pts]
         local hd = v3(last.X - o.X, 0, last.Z - o.Z)
         if hd.Magnitude < 0.1 then hd = v3(dir.X, 0, dir.Z) end
@@ -854,7 +926,7 @@ local function simulate(camera, char)
         maxD = math.max(maxD + 10, 20)
         local cols = {}
         if map.ready or map.n > 0 then
-            local N = 80
+            local N = math.max(10, math.floor(CONFIG.SideColumns))
             for k = 1, N do
                 local d = maxD * k / N
                 local x, z = o.X + hd.X * d, o.Z + hd.Z * d
@@ -971,6 +1043,91 @@ local function refreshHumanoids()
 end
 
 local lastInside = {}
+local tracks = {}       -- name -> list of {t, pos} for speed estimates
+local predictions = {}  -- name -> { pos = predicted position, state = "hit" | "cover" | "out", speed }
+
+local function trackAndPredict(name, pos, horizon)
+    local t = now()
+    local tr = tracks[name]
+    if not tr then tr = {} tracks[name] = tr end
+    tr[#tr + 1] = { t = t, pos = pos }
+    while #tr > 2 and t - tr[2].t > CONFIG.PredictWindow do table.remove(tr, 1) end
+    local first = tr[1]
+    local dt = t - first.t
+    if dt < 0.1 then return nil, 0 end
+    local d = pos - first.pos
+    local vel = v3(d.X / dt, 0, d.Z / dt) -- horizontal only: jumps would throw it off
+    local speed = vel.Magnitude
+    if speed > 60 then return nil, speed end -- teleport / respawn, not running
+    local move = vel * horizon
+    if move.Magnitude > CONFIG.PredictMaxStuds then move = move.Unit * CONFIG.PredictMaxStuds end
+    return pos + move, speed
+end
+
+-- where the blast "sees" from for cover checks: 1 stud up and 0.3 back toward where the grenade came
+-- from, so a grenade resting against a wall isn't treated as being inside that wall
+local function blastCenter(landPos)
+    local o, last = arcPts[1], arcPts[#arcPts]
+    local back = v3(0, 0, 0)
+    if o and last then
+        local hd = v3(last.X - o.X, 0, last.Z - o.Z)
+        if hd.Magnitude > 0.01 then back = hd.Unit * -0.3 end
+    end
+    return landPos + v3(0, 1, 0) + back
+end
+
+-- the person nearest the blast, where they'll be when it goes off; hit / cover / miss and by how much
+local currentTarget = nil
+local function evalTarget(landPos)
+    currentTarget = nil
+    if not (CONFIG.TargetCheck and landPos) then return nil end
+    if now() - humanoidsT > 1 / CONFIG.InBlastScanHz then
+        humanoidsT = now()
+        pcall(refreshHumanoids)
+    end
+    local R = CONFIG.BlastRadius + 1.5 -- +1.5: half a body width
+    local best, bestD = nil, math.huge
+    for _, h in ipairs(humanoids) do
+        local ok, pos = pcall(function() return h.root.Position end)
+        local okH, hp = pcall(function() return h.hum.Health end)
+        if ok and pos and (not okH or hp == nil or hp > 0) then
+            local pr = CONFIG.PredictMovement and predictions[h.name] or nil
+            local pp = pr and pr.pos or pos
+            local d = (pp - landPos).Magnitude
+            if d < bestD and d <= R + CONFIG.TargetMaxDistance then best, bestD = { name = h.name, pos = pos, ppos = pp }, d end
+        end
+    end
+    if not best then return nil end
+    local state = "out"
+    if bestD <= R then
+        state = "hit"
+        if CONFIG.BlastNeedsLineOfSight and map.ready then
+            local center = blastCenter(landPos)
+            if mapHit(center, best.ppos) and mapHit(center, best.ppos + v3(0, 1.5, 0)) then state = "cover" end
+        end
+    end
+    -- how to correct: offset of the target from the blast, along / across the throw
+    local o, last = arcPts[1], arcPts[#arcPts]
+    local hd = (o and last) and v3(last.X - o.X, 0, last.Z - o.Z) or v3(0, 0, -1)
+    if hd.Magnitude < 0.01 then hd = v3(0, 0, -1) end
+    hd = hd.Unit
+    local rt = v3(-hd.Z, 0, hd.X)
+    local delta = best.ppos - landPos
+    best.d, best.state = bestD, state
+    best.missBy = math.max(bestD - R, 0)
+    best.fwd, best.side = dot(delta, hd), dot(delta, rt)
+    currentTarget = best
+    return best
+end
+
+local function targetHint(t)
+    local parts = {}
+    if math.abs(t.fwd) >= 2 then parts[#parts + 1] = string.format("%d %s", math.floor(math.abs(t.fwd) + 0.5), t.fwd > 0 and "further" or "shorter") end
+    if math.abs(t.side) >= 2 then parts[#parts + 1] = string.format("%d %s", math.floor(math.abs(t.side) + 0.5), t.side > 0 and "right" or "left") end
+    if #parts == 0 then return "" end
+    return " - throw " .. table.concat(parts, ", ")
+end
+
 local function drawInBlast(landPos)
     local shown = 0
     local names = {}
@@ -981,26 +1138,46 @@ local function drawInBlast(landPos)
         end
         local R = CONFIG.BlastRadius
         local inside = {}
-        -- blast center sits a little above the spot so the floor/roof it rests on doesn't count as cover
-        local center = landPos + v3(0, 1, 0)
+        -- blast center sits a little above / in front of the spot so the surface it rests on isn't cover
+        local center = blastCenter(landPos)
+        local function blastState(p)
+            if (p - landPos).Magnitude > R + 1.5 then return "out" end -- +1.5: half a body width
+            if CONFIG.BlastNeedsLineOfSight and map.ready then
+                -- check the torso and the head: covered only if both are blocked
+                local toBody = mapHit(center, p)
+                local toHead = mapHit(center, p + v3(0, 1.5, 0))
+                if toBody ~= nil and toHead ~= nil then return "cover" end
+            end
+            return "hit"
+        end
+        -- seconds until it explodes if you throw now
+        local horizon = (arcTimes and arcTimes.fuse) or CONFIG.Fuse
+        local newPred = {}
+        local movingIn = {}
         for _, h in ipairs(humanoids) do
             local ok, pos = pcall(function() return h.root.Position end)
             local okH, hp = pcall(function() return h.hum.Health end)
             local alive = not okH or hp == nil or hp > 0
             if ok and pos and alive then
                 local d = (pos - landPos).Magnitude
-                if d <= R + 1.5 then -- +1.5: half a body width, they're hit if any part is in
-                    local covered = false
-                    if CONFIG.BlastNeedsLineOfSight and map.ready then
-                        -- check the torso and the head: covered only if both are blocked
-                        local toBody = mapHit(center, pos)
-                        local toHead = mapHit(center, pos + v3(0, 1.5, 0))
-                        covered = (toBody ~= nil) and (toHead ~= nil)
+                local state = blastState(pos)
+                local pstate = nil
+                if CONFIG.PredictMovement then
+                    local pp, speed = trackAndPredict(h.name, pos, horizon)
+                    if pp and speed > 1.5 then
+                        pstate = blastState(pp)
+                        newPred[h.name] = { pos = pp, state = pstate, speed = speed }
+                        if state == "out" and pstate == "hit" then
+                            movingIn[#movingIn + 1] = string.format("%s (in %.1fs)", h.name, horizon)
+                        end
                     end
-                    inside[#inside + 1] = { name = h.name, d = d, pos = pos, covered = covered }
+                end
+                if state ~= "out" then
+                    inside[#inside + 1] = { name = h.name, d = d, pos = pos, covered = state == "cover", pstate = pstate }
                 end
             end
         end
+        predictions = newPred
         lastInside = inside
         table.sort(inside, function(a, b)
             if a.covered ~= b.covered then return not a.covered end
@@ -1020,10 +1197,13 @@ local function drawInBlast(landPos)
                 end
             end
             local line = string.format("%s (%d)", e.name, math.floor(e.d))
+            if e.pstate == "out" then line = line .. " - moving out"
+            elseif e.pstate == "cover" and not e.covered then line = line .. " - moving behind cover" end
             if e.covered then cover[#cover + 1] = line else hit[#hit + 1] = line end
         end
         for i = 1, math.min(#hit, CONFIG.InBlastMax) do names[#names + 1] = hit[i] end
         names.cover = cover
+        names.movingIn = movingIn
     end
     for i = shown + 1, #inBlastMarks do inBlastMarks[i].Visible = false end
     names.cover = names.cover or {}
@@ -1051,7 +1231,7 @@ local function collectTopBoxes(center)
         table.sort(list, function(a, c) return a.d < c.d end)
     end
     local out = {}
-    for i = 1, math.min(#list, CONFIG.TopMaxBoxes) do
+    for i = 1, math.min(#list, CONFIG.TopMaxBoxes, 70) do
         local b = list[i].b
         local r, l = b[4], b[6]
         local hx, hz = b[7], b[9]
@@ -1208,10 +1388,47 @@ local function drawTop(camera, fin, color)
         end
     end
     for i = pi + 1, #top.people do top.people[i].Visible = false top.names[i].Visible = false end
+
+    -- line from the blast to the target, colored hit / miss
+    if top.targetLine then
+        local t = currentTarget
+        if t then
+            top.targetLine.Color = (t.state == "hit") and CONFIG.ColorHit or CONFIG.ColorMiss
+            seg(top.targetLine, fin.X, fin.Z, t.ppos.X, t.ppos.Z)
+        else
+            top.targetLine.Visible = false
+        end
+    end
+
+    -- predicted positions at the moment of the explosion
+    local qi = 0
+    if CONFIG.PredictMovement then
+        local stateColor = { hit = CONFIG.InBlastColor, cover = CONFIG.CoverColor }
+        for _, h in ipairs(humanoids) do
+            if qi >= #top.predLines then break end
+            local pr = predictions[h.name]
+            local ok, pos = pcall(function() return h.root.Position end)
+            if pr and ok and pos then
+                local ax, ay = P(pos.X, pos.Z)
+                local bx, by = P(pr.pos.X, pr.pos.Z)
+                if inside(ax, ay) or inside(bx, by) then
+                    qi = qi + 1
+                    local col = stateColor[pr.state] or Color3.fromRGB(200, 200, 200)
+                    local l, c = top.predLines[qi], top.predRings[qi]
+                    l.Color = col
+                    seg(l, pos.X, pos.Z, pr.pos.X, pr.pos.Z)
+                    c.Color = col
+                    if inside(bx, by) then c.Position, c.Visible = Vector2.new(bx, by), true else c.Visible = false end
+                end
+            end
+        end
+    end
+    for i = qi + 1, #top.predLines do top.predLines[i].Visible = false top.predRings[i].Visible = false end
 end
 
 local function draw(camera)
-    pcall(drawPanel, camera)
+    local panelsDue = due("panels", CONFIG.PanelHz)
+    if not CONFIG.SidePanel then hidePanel() elseif panelsDue then pcall(drawPanel, camera) end
     local cf = camera.CFrame
     local camPos, look = cf.Position, cf.LookVector
     local index = 0
@@ -1253,7 +1470,7 @@ local function draw(camera)
         hd = hd.Unit
         local side = v3(-hd.Z, 0, hd.X) * CONFIG.TickWidth
         for i, l in ipairs(ticks) do
-            local p = arcTickPts[i]
+            local p = CONFIG.ArcTicks and arcTickPts[i] or nil
             local sa, sb, depth = nil, nil, nil
             if p then sa, sb, depth = projectSegment(p - side, p + side, camPos, look) end
             if sa then
@@ -1294,12 +1511,48 @@ local function draw(camera)
         color, text = CONFIG.ColorAirburst, arcAirHeight
             and string.format("AIRBURST - explodes %d studs above the ground", math.floor(arcAirHeight))
             or "AIRBURST - explodes before landing"
+    elseif arcTimes.land and arcTimes.fuse and (arcTimes.fuse - arcTimes.land) < CONFIG.FuseWarnMargin then
+        color, text = CONFIG.ColorFuseRisk, string.format("FUSE RISK - lands with only %.1fs of fuse left, may explode in the air",
+            math.max(arcTimes.fuse - arcTimes.land, 0))
     elseif arcRollBurst then
         color, text = CONFIG.ColorRolling, string.format("explodes while rolling - %d studs", math.floor(fromChar or 0))
     elseif not arcFloor then
         color, text = CONFIG.ColorWall, string.format("hits a wall - %d studs", math.floor(fromChar or 0))
     else
         color, text = CONFIG.ColorClear, string.format("%d studs", math.floor(fromChar or 0))
+    end
+    -- target: will the nearest person be hit?
+    local tgt = nil
+    pcall(function() tgt = evalTarget(landPos) end)
+    local tgtText, tgtColor = nil, nil
+    if tgt then
+        if tgt.state == "hit" then
+            tgtColor = CONFIG.ColorHit
+            tgtText = string.format("TARGET %s: HIT (%d studs from the blast)", tgt.name, math.floor(tgt.d))
+        elseif tgt.state == "cover" then
+            tgtColor = CONFIG.ColorMiss
+            tgtText = string.format("WILL MISS %s: behind cover%s", tgt.name, targetHint(tgt))
+        else
+            tgtColor = CONFIG.ColorMiss
+            tgtText = string.format("WILL MISS %s by %d studs%s", tgt.name, math.ceil(tgt.missBy), targetHint(tgt))
+        end
+        -- a sure miss turns the whole prediction red (being in the blast yourself still takes priority)
+        if tgt.state ~= "hit" and not (dist3 and dist3 <= CONFIG.BlastRadius) then
+            color = CONFIG.ColorMiss
+            text = "MISS - " .. text
+        end
+    end
+    if tgtText then
+        local okV, vp = pcall(function() return camera.ViewportSize end)
+        local W, H = 1920, 1080
+        if okV and vp then W, H = vp.X, vp.Y end
+        targetText.Text, targetText.Color = tgtText, tgtColor
+        targetText.Position, targetText.Visible = Vector2.new(W * CONFIG.TargetHudPos.X, H * CONFIG.TargetHudPos.Y), true
+        local sa, sb = projectSegment(landPos + v3(0, 0.5, 0), tgt.ppos, camPos, look)
+        if sa then targetLine.From, targetLine.To, targetLine.Color, targetLine.Visible = sa, sb, tgtColor, true
+        else targetLine.Visible = false end
+    else
+        targetText.Visible, targetLine.Visible = false, false
     end
     if #arcBounces > 0 then
         text = text .. (#arcBounces == 1 and "  |  bounces off a wall" or string.format("  |  bounces off %d walls", #arcBounces))
@@ -1313,7 +1566,7 @@ local function draw(camera)
     -- blast radius ring, lying flat on the ground around the final spot
     local ringShown = false
     if landPos and CONFIG.ShowBlastRadius then
-        local n, R = #blastRing, CONFIG.BlastRadius
+        local n, R = math.min(math.max(math.floor(CONFIG.BlastSegments), 8), #blastRing), CONFIG.BlastRadius
         local y = landPos.Y + 0.2
         local prev = v3(landPos.X + R, y, landPos.Z)
         for i = 1, n do
@@ -1329,13 +1582,16 @@ local function draw(camera)
             end
             prev = cur
         end
+        for i = n + 1, #blastRing do if blastRing[i].Visible then blastRing[i].Visible = false end end
     else
         for _, l in ipairs(blastRing) do l.Visible = false end
     end
 
     -- humanoids inside the ring
     local names = drawInBlast(landPos)
-    if CONFIG.TopPanel then
+    if not CONFIG.TopPanel then
+        hideTop()
+    elseif panelsDue then
         local okT, errT = pcall(drawTop, camera, landPos, color)
         if not okT and CONFIG.Debug and now() - (topErrT or 0) > 5 then
             topErrT = now()
@@ -1343,7 +1599,8 @@ local function draw(camera)
         end
     end
     local cover = names.cover
-    local hasAny = #names > 0 or #cover > 0
+    local movingIn = names.movingIn or {}
+    local hasAny = #names > 0 or #cover > 0 or #movingIn > 0
     if hasAny then
         local parts = {}
         if #names > 0 then
@@ -1353,6 +1610,9 @@ local function draw(camera)
         end
         if #cover > 0 then
             parts[#parts + 1] = "behind cover: " .. table.concat(cover, ", ")
+        end
+        if #movingIn > 0 then
+            parts[#parts + 1] = "moving into the blast: " .. table.concat(movingIn, ", ")
         end
         inBlastText.Text = table.concat(parts, "\n")
         inBlastText.Color = (#names > 0) and CONFIG.InBlastColor or CONFIG.CoverColor
@@ -1404,18 +1664,6 @@ local function draw(camera)
     end
 end
 
--- rate limiter: returns true at most hz times per second (hz <= 0 means always)
-local lastTick = {}
-local function due(key, hz)
-    if not hz or hz <= 0 then return true end
-    local t = now()
-    if not lastTick[key] or t - lastTick[key] >= 1 / hz then
-        lastTick[key] = t
-        return true
-    end
-    return false
-end
-
 local function update(camera, char, fresh)
     if fresh or due("physics", CONFIG.PhysicsHz) then simulate(camera, char) end
     if fresh or due("draw", CONFIG.DrawHz) then draw(camera) end
@@ -1465,6 +1713,8 @@ end
 -- When the grenade leaves your hand, find the flying grenade part, sample its path,
 -- and fit speed / gravity / up-bias / start offset from the real flight.
 local calibResults = {}   -- every accepted throw
+local lastReleaseT = nil  -- when the last grenade appeared (released), for timing the fuse
+local fuseSamples = {}
 local calib = nil          -- { t0, origin, dir, part, samples, deadline, known }
 local lastLaunch = nil     -- origin/dir from the last frame the grenade was in hand
 
@@ -1517,9 +1767,11 @@ local function startCalibrationWith(part)
     calib.samples.launchT, calib.samples.origin, calib.samples.dir = t0, launch.origin, launch.dir
     calib.samples.launch = launch
     calib.samples.predLand, calib.samples.predRest, calib.samples.predRoot = arcLand, arcRest, arcRoot
+    calib.samples.predSrc, calib.samples.predBounces = arcLandSrc, #arcBounces
     calib.samples.holdSecs = hold.lastHold or (hold.pressT and (now() - hold.pressT))
     calib.samples.pinSecs = hold.pinT and (now() - hold.pinT)
     calib.samples.timerVal = hold.timer
+    lastReleaseT = t0
     if CONFIG.Debug then print("[Trajectory] throw detected: " .. part.Name) end
     if CONFIG.LogThrows then startFlightLog(part, t0, launch) end
 end
@@ -1589,24 +1841,34 @@ local function finishCalibration()
     pcall(function()
         local thin = { full[1] }
         for i = 2, #full do
-            if full[i].t - thin[#thin].t >= 0.045 then thin[#thin + 1] = full[i] end
+            if full[i].t - thin[#thin].t >= 0.1 then thin[#thin + 1] = full[i] end
         end
         local function hv(a, b)
             local d = b.pos - a.pos
             local dtt = math.max(b.t - a.t, 1e-3)
             return v3(d.X / dtt, 0, d.Z / dtt), d.Y / dtt
         end
-        for i = 3, #thin - 1 do
+        for i = 3, #thin - 2 do
             local vin, vyIn = hv(thin[i - 2], thin[i - 1])
-            local vout, vyOut = hv(thin[i], thin[i + 1])
+            -- "after" starts one step later: the step containing the impact mixes in and out
+            local vout, vyOut = hv(thin[i + 1], thin[i + 2])
             local sIn = vin.Magnitude
             if sIn > 25 then
                 local u = vin * (1 / sIn)
                 local along = dot(vout, u)          -- speed still going the same way
                 local side = (vout - u * along).Magnitude
                 local changed = along < sIn * 0.6
+                -- a wall hit happens in the air, above where the grenade ends up (not while rolling)
+                if thin[i - 1].pos.Y < full[#full].pos.Y + 1.5 then changed = false end
+                -- ignore one-step glitches: the next step must also be slow
+                if changed and thin[i + 3] then
+                    local vnext = hv(thin[i + 2], thin[i + 3])
+                    if dot(vnext, u) > sIn * 0.6 then changed = false end
+                end
+                if sIn > 300 then changed = false end -- faster than any throw: a burst of position updates
                 -- a floor landing flips the vertical speed; a wall hit doesn't stop it falling
-                local floorLike = vyIn < -5 and vyOut > vyIn * 0.3 and math.abs(thin[i].pos.Y - thin[i - 1].pos.Y) < 0.5
+                -- a floor stops the fall (or bounces it up); after a wall hit it keeps falling
+                local floorLike = vyIn < -5 and vyOut > -3
                 if changed and not floorLike then
                     local back = math.max(-along, 0) / sIn
                     print(string.format("[Trajectory] wall hit measured: came in at %.0f studs/s, after: %.0f%% bounced back, %.0f%% kept going forward, %.0f studs/s sideways",
@@ -1623,24 +1885,44 @@ local function finishCalibration()
         -- fixed model: only report how close the prediction was
         if CONFIG.ReportAccuracy and #full > 3 and s.predLand then
             local rest = full[#full].pos
-            -- first impact: the first time its horizontal speed drops below 75% of its flight speed
-            -- (measured over >= 0.045s steps; the hover before launch is skipped)
+            -- first impact, read over 0.1s steps (position updates arrive in bursts, so shorter steps
+            -- show fake speed spikes): the first step where it bounces up, or where its horizontal
+            -- speed drops below 70% of its typical flight speed and stays down for the next step too
             local impact = rest
             local thin = { full[1] }
             for i = 2, #full do
-                if full[i].t - thin[#thin].t >= 0.045 then thin[#thin + 1] = full[i] end
+                if full[i].t - thin[#thin].t >= 0.1 then thin[#thin + 1] = full[i] end
             end
-            local flightSpeed = nil
+            local hs, vys = {}, {}
             for i = 2, #thin do
                 local d = thin[i].pos - thin[i - 1].pos
-                local h = v3(d.X, 0, d.Z).Magnitude / math.max(thin[i].t - thin[i - 1].t, 1e-3)
-                if not flightSpeed then
-                    if h > 30 then flightSpeed = h end
-                elseif h < flightSpeed * 0.75 then
+                local dtt = math.max(thin[i].t - thin[i - 1].t, 1e-3)
+                hs[i], vys[i] = v3(d.X, 0, d.Z).Magnitude / dtt, d.Y / dtt
+            end
+            local function medianOf(list, a, b)
+                local arr = {}
+                for i = a, b do if list[i] then arr[#arr + 1] = list[i] end end
+                if #arr == 0 then return nil end
+                table.sort(arr)
+                return arr[math.floor((#arr + 1) / 2)]
+            end
+            for i = 4, #thin do
+                local typical = medianOf(hs, 2, i - 1)
+                local bouncedUp = vys[i - 1] and vys[i] and vys[i - 1] < -10 and vys[i] > vys[i - 1] + 25
+                local slowed = typical and typical > 30 and hs[i] < typical * 0.7 and (hs[i + 1] == nil or hs[i + 1] < typical * 0.7)
+                if bouncedUp or slowed then
                     impact = thin[i - 1].pos
+                    -- floor hit: the exact impact is the lowest raw sample around this step
+                    local lo, hi = thin[math.max(i - 2, 1)].t, thin[i].t
+                    local minY = nil
+                    for _, sm in ipairs(full) do
+                        if sm.t >= lo and sm.t <= hi and (not minY or sm.pos.Y < minY) then minY = sm.pos.Y end
+                    end
+                    -- the first raw sample that reaches (about) the ground: rolling jitters the height a bit
+                    for _, sm in ipairs(full) do
+                        if minY and sm.t >= lo and sm.t <= hi and sm.pos.Y <= minY + 0.4 then impact = sm.pos break end
+                    end
                     break
-                else
-                    flightSpeed = math.max(flightSpeed, h)
                 end
             end
             local function hd(a, b) return v3(a.X - b.X, 0, a.Z - b.Z).Magnitude end
@@ -1651,6 +1933,49 @@ local function finishCalibration()
                 msg = msg .. string.format(", final spot off %.1f studs", (s.predRest - rest).Magnitude)
             end
             print(msg)
+            -- breakdown, so a miss can be traced to the flight, the ground height, or the bounce/roll
+            pcall(function()
+                local L = s.launch
+                local hdir = L and v3(L.look.X, 0, L.look.Z) or v3(0, 0, -1)
+                hdir = hdir.Magnitude > 0.01 and hdir.Unit or v3(0, 0, -1)
+                local rdir = v3(-hdir.Z, 0, hdir.X)
+                local e = impact - s.predLand
+                print(string.format("[Trajectory]   impact: real landed %.1f studs %s and %.1f %s of the prediction; height real %.1f vs predicted %.1f (%s)",
+                    math.abs(dot(e, hdir)), dot(e, hdir) >= 0 and "further" or "shorter",
+                    math.abs(dot(e, rdir)), dot(e, rdir) >= 0 and "right" or "left",
+                    impact.Y, s.predLand.Y, s.predSrc or "unknown surface"))
+                local realRoll = hd(rest, impact)
+                local predRoll = s.predRest and hd(s.predRest, s.predLand) or 0
+                -- measured bounce: horizontal speed just before vs ~0.15s after the impact
+                local before, after = nil, nil
+                local ii = nil
+                for i = 2, #thin do
+                    if not ii and thin[i].t >= 0 and (thin[i].pos - impact).Magnitude < 0.01 then ii = i end
+                end
+                if not ii then
+                    -- nearest thin step at or after the impact sample
+                    local tImp = nil
+                    for _, sm in ipairs(full) do if (sm.pos - impact).Magnitude < 0.01 then tImp = sm.t break end end
+                    if tImp then for i = 2, #thin do if thin[i].t >= tImp then ii = i break end end end
+                end
+                for i = ii or (#thin + 1), #thin do
+                    do
+                        before = medianOf(hs, 2, i)
+                        local j = i
+                        while thin[j + 1] and thin[j + 1].t - thin[i].t < 0.2 do j = j + 1 end
+                        if thin[j + 1] then j = j + 1 end
+                        if j > i then after = hd(thin[j].pos, thin[i].pos) / math.max(thin[j].t - thin[i].t, 1e-3) end
+                        break
+                    end
+                end
+                local keep = (before and after and before > 1) and (after / before) or nil
+                local fric = (after and realRoll > 0.5) and (after * after / (2 * realRoll)) or nil
+                print(string.format("[Trajectory]   roll: real %.1f studs vs predicted %.1f | hit the ground at %s studs/s, kept %s (setting %.2f), slowed at %s (setting %.0f)%s",
+                    realRoll, predRoll, before and string.format("%.0f", before) or "?",
+                    keep and string.format("%.2f", keep) or "?", CONFIG.BounceKeep,
+                    fric and string.format("%.0f", fric) or "?", CONFIG.RollFriction,
+                    (s.predBounces or 0) > 0 and string.format(" | predicted %d wall bounce(s)", s.predBounces) or ""))
+            end)
         end
         return
     end
@@ -1988,6 +2313,20 @@ local function stepWatcher(holding)
                                 first = pa - pb, t = t }
                         end
                     end
+                    if item.Name == "GrenadeExplosion" and lastReleaseT and t - lastReleaseT < 8 then
+                        local fuse = t - lastReleaseT
+                        lastReleaseT = nil
+                        fuseSamples[#fuseSamples + 1] = fuse
+                        local arr = {}
+                        for i, v in ipairs(fuseSamples) do arr[i] = v end
+                        table.sort(arr)
+                        local med = arr[math.floor((#arr + 1) / 2)]
+                        print(string.format("[Trajectory] fuse measured: %.2fs from release to explosion (median of %d: %.2fs)",
+                            fuse, #arr, med))
+                        if CONFIG.FuseFromGame and CONFIG.FuseStart == "Throw" then
+                            CONFIG.Fuse = med
+                        end
+                    end
                     if okP and part and item.Name == "GrenadeExplosion" and isPart(part) then
                         explosions[#explosions + 1] = { part = part, untilT = t + 1, maxR = 0 }
                     end
@@ -2030,6 +2369,210 @@ local function stepWatcher(holding)
         end
     end
     watcher.candidates = keep
+end
+
+-- ---------- settings menu (keyboard: Right Shift opens, arrows move/change, Enter toggles) ----------
+local PRESETS = {
+    High   = { PhysicsHz = 20, DrawHz = 60, PanelHz = 30, SideColumns = 80, TopMaxBoxes = 70, BlastSegments = 40,
+               SidePanel = true, TopPanel = true, ArcTicks = true, PredictMovement = true, InBlastScanHz = 2,
+               WatchHz = 20, MapMsPerFrame = 6 },
+    Medium = { PhysicsHz = 15, DrawHz = 45, PanelHz = 15, SideColumns = 50, TopMaxBoxes = 45, BlastSegments = 32,
+               SidePanel = true, TopPanel = true, ArcTicks = true, PredictMovement = true, InBlastScanHz = 2,
+               WatchHz = 15, MapMsPerFrame = 4 },
+    Low    = { PhysicsHz = 10, DrawHz = 30, PanelHz = 8, SideColumns = 30, TopMaxBoxes = 25, BlastSegments = 24,
+               SidePanel = false, TopPanel = true, ArcTicks = false, PredictMovement = true, InBlastScanHz = 1,
+               WatchHz = 10, MapMsPerFrame = 3 },
+    Potato = { PhysicsHz = 6, DrawHz = 20, PanelHz = 4, SideColumns = 20, TopMaxBoxes = 12, BlastSegments = 16,
+               SidePanel = false, TopPanel = false, ArcTicks = false, PredictMovement = false, InBlastScanHz = 1,
+               WatchHz = 8, MapMsPerFrame = 2, Debug = false, LogThrows = false },
+}
+local PRESET_ORDER = { "High", "Medium", "Low", "Potato" }
+
+local MENU_ITEMS = {
+    { label = "Preset",              kind = "preset" },
+    { label = "Side view panel",     kind = "bool", key = "SidePanel" },
+    { label = "Top view panel",      kind = "bool", key = "TopPanel" },
+    { label = "Blast ring",          kind = "bool", key = "ShowBlastRadius" },
+    { label = "People in blast",     kind = "bool", key = "ShowInBlast" },
+    { label = "Movement prediction", kind = "bool", key = "PredictMovement" },
+    { label = "Target hit / miss",   kind = "bool", key = "TargetCheck" },
+    { label = "Arc depth ticks",     kind = "bool", key = "ArcTicks" },
+    { label = "Wall bounces",        kind = "bool", key = "WallBounce" },
+    { label = "Map collision",       kind = "bool", key = "MapCollision" },
+    { label = "Arc updates / sec",   kind = "num",  key = "PhysicsHz",     min = 4,  max = 30, step = 2 },
+    { label = "Draw updates / sec",  kind = "num",  key = "DrawHz",        min = 15, max = 60, step = 5 },
+    { label = "Panel updates / sec", kind = "num",  key = "PanelHz",       min = 2,  max = 60, step = 2 },
+    { label = "Side view detail",    kind = "num",  key = "SideColumns",   min = 10, max = 80, step = 10 },
+    { label = "Top view parts",      kind = "num",  key = "TopMaxBoxes",   min = 5,  max = 70, step = 5 },
+    { label = "Top view range",      kind = "num",  key = "TopViewRange",  min = 20, max = 90, step = 5 },
+    { label = "Ring smoothness",     kind = "num",  key = "BlastSegments", min = 8,  max = 40, step = 4 },
+    { label = "Debug messages",      kind = "bool", key = "Debug" },
+    { label = "Log throws",          kind = "bool", key = "LogThrows" },
+    { label = "Save settings",       kind = "action", act = "save" },
+    { label = "Close",               kind = "action", act = "close" },
+}
+local SAVED_KEYS = { "SidePanel", "TopPanel", "ShowBlastRadius", "ShowInBlast", "PredictMovement", "TargetCheck", "ArcTicks",
+    "WallBounce", "MapCollision", "PhysicsHz", "DrawHz", "PanelHz", "SideColumns", "TopMaxBoxes", "TopViewRange",
+    "BlastSegments", "Debug", "LogThrows", "InBlastScanHz", "WatchHz", "MapMsPerFrame" }
+
+local menu = { open = false, sel = 1, preset = "Custom", rows = {}, keys = {}, msg = nil, msgT = 0 }
+
+local function saveSettings()
+    local out = {}
+    for _, k in ipairs(SAVED_KEYS) do out[#out + 1] = k .. "=" .. tostring(CONFIG[k]) end
+    local text = table.concat(out, "\n")
+    _G.TrajectorySavedSettings = text -- survives reloads in this session even without writefile
+    local ok = pcall(function() writefile(CONFIG.SaveFile, text) end)
+    return ok
+end
+
+local function applySettingsText(text)
+    if type(text) ~= "string" then return 0 end
+    local n = 0
+    for line in text:gmatch("[^\r\n]+") do
+        local k, v = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+        if k and CONFIG[k] ~= nil then
+            if v == "true" then CONFIG[k] = true n = n + 1
+            elseif v == "false" then CONFIG[k] = false n = n + 1
+            elseif tonumber(v) then CONFIG[k] = tonumber(v) n = n + 1 end
+        end
+    end
+    return n
+end
+
+local function loadSettings()
+    local text = nil
+    pcall(function() if isfile and isfile(CONFIG.SaveFile) then text = readfile(CONFIG.SaveFile) end end)
+    text = text or _G.TrajectorySavedSettings
+    local n = applySettingsText(text)
+    if n > 0 then print("[Trajectory] loaded " .. n .. " saved setting(s)") end
+end
+
+local function keyFired(vk, repeatable)
+    local ok, down = pcall(iskeypressed, vk)
+    down = ok and down or false
+    local st = menu.keys[vk]
+    if not st then st = { down = false, nextT = 0 } menu.keys[vk] = st end
+    local t, fire = now(), false
+    if down and not st.down then
+        fire, st.nextT = true, t + 0.35
+    elseif down and repeatable and t >= st.nextT then
+        fire, st.nextT = true, t + 0.07
+    end
+    st.down = down
+    return fire
+end
+
+local function menuValue(item)
+    if item.kind == "preset" then return "< " .. menu.preset .. " >" end
+    if item.kind == "bool" then return CONFIG[item.key] and "ON" or "off" end
+    if item.kind == "num" then return "< " .. tostring(math.floor(CONFIG[item.key] + 0.5)) .. " >" end
+    return ""
+end
+
+local function menuChange(item, dir)
+    if item.kind == "preset" then
+        local idx = 1
+        for i, name in ipairs(PRESET_ORDER) do if name == menu.preset then idx = i end end
+        if menu.preset == "Custom" then idx = (dir > 0) and 0 or 2 end
+        idx = ((idx - 1 + dir) % #PRESET_ORDER) + 1
+        menu.preset = PRESET_ORDER[idx]
+        for k, v in pairs(PRESETS[menu.preset]) do CONFIG[k] = v end
+    elseif item.kind == "bool" then
+        CONFIG[item.key] = not CONFIG[item.key]
+        menu.preset = "Custom"
+    elseif item.kind == "num" then
+        CONFIG[item.key] = clamp((CONFIG[item.key] or item.min) + dir * item.step, item.min, item.max)
+        menu.preset = "Custom"
+    end
+end
+
+local menuBg, menuTitle, menuHelp
+local function ensureMenuDrawings()
+    if menuBg then return end
+    menuBg = newDrawing("Square")
+    menuBg.Filled, menuBg.Color, menuBg.Transparency, menuBg.Visible = true, Color3.fromRGB(15, 15, 22), 0.85, false
+    menuTitle = newDrawing("Text")
+    menuTitle.Size, menuTitle.Color, menuTitle.Outline, menuTitle.Visible = 16, Color3.fromRGB(90, 210, 255), true, false
+    menuHelp = newDrawing("Text")
+    menuHelp.Size, menuHelp.Color, menuHelp.Outline, menuHelp.Visible = 12, Color3.fromRGB(160, 160, 170), true, false
+    for i = 1, #MENU_ITEMS do
+        local t = newDrawing("Text")
+        t.Size, t.Outline, t.Visible = 14, true, false
+        menu.rows[i] = t
+    end
+end
+
+local function hideMenu()
+    if not menuBg then return end
+    menuBg.Visible, menuTitle.Visible, menuHelp.Visible = false, false, false
+    for _, t in ipairs(menu.rows) do t.Visible = false end
+end
+
+local function removeMenu()
+    if not menuBg then return end
+    menuBg:Remove() menuTitle:Remove() menuHelp:Remove()
+    for _, t in ipairs(menu.rows) do t:Remove() end
+end
+
+local function drawMenu(camera)
+    ensureMenuDrawings()
+    local okV, vp = pcall(function() return camera.ViewportSize end)
+    local H = (okV and vp) and vp.Y or 1080
+    -- left side, below the top-left Roblox buttons
+    local x0, y0, rowH, w = 30, math.floor(H * 0.22), 19, 330
+    menuBg.Position, menuBg.Size, menuBg.Visible = Vector2.new(x0 - 12, y0 - 34), Vector2.new(w, #MENU_ITEMS * rowH + 70), true
+    menuTitle.Text, menuTitle.Position, menuTitle.Visible = "Grenade trajectory - settings", Vector2.new(x0, y0 - 28), true
+    for i, item in ipairs(MENU_ITEMS) do
+        local t = menu.rows[i]
+        local selected = (i == menu.sel)
+        local val = menuValue(item)
+        t.Text = (selected and "> " or "  ") .. item.label .. string.rep(" ", math.max(1, 24 - #item.label)) .. val
+        t.Color = selected and Color3.fromRGB(255, 220, 90)
+            or (item.kind == "action" and Color3.fromRGB(150, 200, 255) or Color3.fromRGB(230, 230, 235))
+        t.Position, t.Visible = Vector2.new(x0, y0 + (i - 1) * rowH), true
+    end
+    local help = "Up/Down: pick   Left/Right: change   Enter: toggle   Right Shift: close"
+    if menu.msg and now() - menu.msgT < 3 then help = menu.msg end
+    menuHelp.Text, menuHelp.Position, menuHelp.Visible = help, Vector2.new(x0, y0 + #MENU_ITEMS * rowH + 8), true
+end
+
+-- saved menu settings first, then the loader's _G.TrajectoryConfig on top (the loader wins)
+pcall(loadSettings)
+if type(_G.TrajectoryConfig) == "table" then
+    for k, v in pairs(_G.TrajectoryConfig) do if CONFIG[k] ~= nil then CONFIG[k] = v end end
+end
+
+-- returns true while the menu is open (so the caller can keep drawing it)
+local function stepMenu(camera)
+    if keyFired(CONFIG.MenuKey, false) then
+        menu.open = not menu.open
+        if not menu.open then hideMenu() end
+    end
+    if not menu.open then return false end
+    local VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ENTER = 0x26, 0x28, 0x25, 0x27, 0x0D
+    if keyFired(VK_UP, true) then menu.sel = (menu.sel - 2) % #MENU_ITEMS + 1 end
+    if keyFired(VK_DOWN, true) then menu.sel = menu.sel % #MENU_ITEMS + 1 end
+    local item = MENU_ITEMS[menu.sel]
+    if keyFired(VK_LEFT, true) and item.kind ~= "action" then menuChange(item, -1) end
+    if keyFired(VK_RIGHT, true) and item.kind ~= "action" then menuChange(item, 1) end
+    if keyFired(VK_ENTER, false) then
+        if item.kind == "action" then
+            if item.act == "save" then
+                local ok = saveSettings()
+                menu.msg = ok and ("saved to " .. CONFIG.SaveFile) or "saved for this session (executor can't write files)"
+                menu.msgT = now()
+            elseif item.act == "close" then
+                menu.open = false
+                hideMenu()
+                return false
+            end
+        else
+            menuChange(item, 1)
+        end
+    end
+    pcall(drawMenu, camera)
+    return true
 end
 
 -- ---------- loop ----------
@@ -2081,6 +2624,7 @@ local function step()
         if not okM then map.building, map.failed = false, true print("[Trajectory] map read error: " .. tostring(errM)) end
     end
     local camera = Workspace.CurrentCamera
+    if camera then pcall(stepMenu, camera) end
     local char   = LocalPlayer.Character
     if not camera or not char then if visible then hideAll() visible = false end return end
 
@@ -2204,12 +2748,15 @@ stop = function()
     status:Remove()
     for _, c in ipairs(inBlastMarks) do c:Remove() end
     inBlastText:Remove()
+    targetText:Remove()
+    targetLine:Remove()
     label:Remove()
+    removeMenu()
     if _G.stopTrajectory == stop then _G.stopTrajectory = nil end
 end
 _G.stopTrajectory = stop
 
-print("[Trajectory] loaded (" .. CONFIG.ShowMode .. " mode). X = unload, R = reset calibration.")
+print("[Trajectory] loaded (" .. CONFIG.ShowMode .. " mode). X = unload, R = reset calibration, Right Shift = settings.")
 do
     local okG, wg = pcall(function() return Workspace.Gravity end)
     print("[Trajectory] game gravity (Workspace.Gravity) = " .. (okG and tostring(wg) or "unreadable"))
