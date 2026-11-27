@@ -84,11 +84,36 @@ local CONFIG = {
     TargetMaxDistance  = 40,     -- studs beyond the blast edge to still count someone as the target
     ColorHit           = Color3.fromRGB(80, 255, 120),  -- the target will be hit
     ColorMiss          = Color3.fromRGB(255, 60, 60),   -- the target will NOT be hit
+    -- aim helper: works out where to point the crosshair so the blast lands on the target
+    AimAssist          = true,
+    AimHz              = 3,      -- how often the best aim is re-solved (each solve tries ~40 throws)
+    AimTriesPerFrame   = 6,      -- test throws per frame (a solve is spread over frames: no stutter)
+    AimOnTargetDeg     = 0.6,    -- within this many degrees counts as "on target"
+    AimPickAngle       = 20,     -- with no one near the blast, pick the person within this many degrees of your aim
+    ColorAim           = Color3.fromRGB(255, 255, 255),
+    -- "move here": when the best throw from where you stand misses (or lands a few studs off),
+    -- test nearby spots you could walk to and point to the closest one that does better
+    MoveHelper         = true,
+    MoveAlways         = true,   -- show the suggestion whenever a target is picked up (false: only when the throw from here is off)
+    MoveWhenOffBy      = 3,      -- studs: with MoveAlways off, only look for a better spot when the best throw lands further off than this
+    MoveMinGain        = 1.5,    -- studs: a spot must get the blast at least this much closer to be suggested
+    MoveRadii          = { 10, 20, 35, 55 }, -- distances (studs) of the spots tested around you
+    MoveDirections     = 8,      -- spots per distance
+    MoveAroundTarget   = { 30, 50 }, -- also test spots this far from the target, all around it (gets around walls / roofs)
+    MoveSightDirs      = 24,     -- when you can't see the target: directions searched for spots that can (windows, doors)
+    MoveSightDist      = { 20, 35, 50, 70 },
+    MoveMaxWalk        = 160,    -- spots around the target further than this walk are skipped
+    MoveFinalists      = 4,      -- best spots from the quick screen that get the full (aim-helper) solve
+    MoveTriesPerFrame  = 8,      -- test throws per frame for this search (spread over frames)
+    MoveEveryS         = 1.5,    -- seconds between searches
+    ColorMove          = Color3.fromRGB(80, 220, 255),
     InBlastHud         = true,   -- show the names at a fixed spot on screen (not attached to the landing spot)
     BlastNeedsLineOfSight = true, -- walls/roofs/floors between the blast and a person shield them
     CoverColor         = Color3.fromRGB(150, 150, 150),
     InBlastHudPos      = Vector2.new(0.5, 0.58), -- where, as a fraction of the screen (0.5, 0.58 = just below the crosshair)
     TargetHudPos       = Vector2.new(0.5, 0.53), -- where the target line (HIT / WILL MISS) is shown
+    AimHudPos          = Vector2.new(0.5, 0.49), -- where the aim hint (aim 3 deg up, 1 deg left) is shown
+    MoveHudPos         = Vector2.new(0.5, 0.45), -- where the "MOVE ..." hint is shown
     LaunchFrom         = "Head", -- "Head", "Hand", "Camera" or "Root": the spot the arc is anchored to.
                                  -- Head is steady; Hand moves with the wind-up animation (calibration never changes this)
     ResetKey           = 0x52,   -- R: throw away all calibration and go back to the defaults above
@@ -101,7 +126,9 @@ local CONFIG = {
     GrenadeNameMatch   = "grenade",
     Debug              = true,   -- print equip / throw / new-object events
     -- folders to look in for the flying grenade ("" = Workspace itself, "Camera" = CurrentCamera)
-    ProjectileFolders  = { "Filter", "Debris", "", "Camera" },
+    -- this game's grenade and explosion always appear in Workspace.Debris, so only that is watched
+    -- (watching many big folders 20x a second was slow on weak PCs). Add "Filter", "", "Camera" for other games.
+    ProjectileFolders  = { "Debris" },
     ProjectileSkip     = { Map = true, Terrain = true, Audio = true },
     WatchHz            = 20,     -- how often the watched folders are checked while a grenade is held
     ProjectileMinSpeed = 15,     -- studs/sec a part must move away from your hand to count
@@ -122,6 +149,10 @@ local CONFIG = {
     PanelHz            = 30,     -- how often the side view / top view are redrawn
     SideColumns        = 80,     -- side view detail (slices through buildings): fewer = faster
     MenuKey            = 0xA1,   -- Right Shift: open / close the settings menu
+    Preset             = false,  -- "High" / "Medium" / "Low" / "Potato": apply a preset at load (e.g. from the loader)
+    AutoPerformance    = false,  -- true = if FPS stays low, step down to a lighter preset by itself
+    AutoPerfMinFps     = 30,     -- below this for a few seconds = step down
+    PerfReportKey      = 0x50,   -- P: print where the script spends its time
     SaveFile           = "grenade-trajectory-settings.txt", -- settings are saved here (if the executor has writefile)
     LogHz              = 20,     -- flight-log samples per second
     AimDistance        = 60,
@@ -208,6 +239,15 @@ local now = (os and os.clock) or tick
 
 -- Drawing objects behind a small cache: a property is only sent to the executor when its value
 -- actually changes (re-hiding already-hidden lines every frame was most of the drawing work)
+-- ---------- profiler: where the script spends its time ----------
+local perf = { acc = {}, t0 = nil, frames = 0, frameStart = nil, emaDt = nil, lowSince = nil }
+local function timed(name, fn, ...)
+    local a = now()
+    local r1, r2 = fn(...)
+    perf.acc[name] = (perf.acc[name] or 0) + (now() - a)
+    return r1, r2
+end
+
 local function newDrawing(kind)
     local real = Drawing.new(kind)
     local shadow = {}
@@ -231,11 +271,20 @@ end
 
 -- rate limiter: returns true at most hz times per second (hz <= 0 means always)
 local lastTick = {}
+local tickSeed = 0
 local function due(key, hz)
     if not hz or hz <= 0 then return true end
     local t = now()
-    if not lastTick[key] or t - lastTick[key] >= 1 / hz then
-        lastTick[key] = t
+    if not lastTick[key] then
+        -- stagger each timer by a different fraction of its period, so the periodic jobs
+        -- (arc, panels, aim solver, people scan) don't all land on the same frame
+        tickSeed = tickSeed + 1
+        lastTick[key] = t - (1 / hz) * ((tickSeed * 0.618) % 1)
+        return false
+    end
+    if t - lastTick[key] >= 1 / hz then
+        -- keep the phase (step forward by whole periods) instead of snapping to now
+        lastTick[key] = lastTick[key] + (1 / hz) * math.max(1, math.floor((t - lastTick[key]) * hz))
         return true
     end
     return false
@@ -313,6 +362,23 @@ inBlastText.Size, inBlastText.Center, inBlastText.Outline, inBlastText.Color, in
     CONFIG.LabelSize + 4, true, true, CONFIG.InBlastColor, false
 local targetText = newDrawing("Text")
 targetText.Size, targetText.Center, targetText.Outline, targetText.Visible = CONFIG.LabelSize + 6, true, true, false
+local aimMark = newDrawing("Circle")
+aimMark.Radius, aimMark.Thickness, aimMark.NumSides, aimMark.Filled, aimMark.Transparency, aimMark.Visible = 9, 2, 20, false, 1, false
+local aimCrossH, aimCrossV, aimAltMark = newDrawing("Line"), newDrawing("Line"), newDrawing("Circle")
+aimCrossH.Thickness, aimCrossV.Thickness, aimCrossH.Visible, aimCrossV.Visible = 2, 2, false, false
+aimAltMark.Radius, aimAltMark.Thickness, aimAltMark.NumSides, aimAltMark.Filled, aimAltMark.Visible = 6, 1, 12, false, false
+local moveRing = {}
+for i = 1, 16 do
+    local l = newDrawing("Line")
+    l.Thickness, l.Transparency, l.Visible = 2, 1, false
+    moveRing[i] = l
+end
+local moveLine = newDrawing("Line")
+moveLine.Thickness, moveLine.Transparency, moveLine.Visible = 1, 1, false
+local moveText = newDrawing("Text")
+moveText.Size, moveText.Center, moveText.Outline, moveText.Visible = CONFIG.LabelSize + 2, true, true, false
+local aimText = newDrawing("Text")
+aimText.Size, aimText.Center, aimText.Outline, aimText.Visible = CONFIG.LabelSize + 2, true, true, false
 local targetLine = newDrawing("Line")
 targetLine.Thickness, targetLine.Transparency, targetLine.Visible = 2, 1, false
 local status = newDrawing("Text")
@@ -393,6 +459,7 @@ do -- (always created, so the top view can be switched on from the settings menu
     top.me = newCircle(Color3.fromRGB(90, 170, 255), 4, true)
     for i = 1, 3 do top.bounces[i] = newCircle(CONFIG.RollColor, 3, false) end
     top.targetLine = newLine(CONFIG.ColorMiss, 2)
+    top.moveDot = newCircle(CONFIG.ColorMove, 4, false)
     top.predLines, top.predRings = {}, {}
     for i = 1, 14 do
         top.predLines[i] = newLine(Color3.fromRGB(255, 255, 255), 1)
@@ -415,6 +482,7 @@ local function topAll(fn)
     for _, c in ipairs(top.bounces) do fn(c) end
     for _, l in ipairs(top.predLines or {}) do fn(l) end
     if top.targetLine then fn(top.targetLine) end
+    if top.moveDot then fn(top.moveDot) end
     for _, c in ipairs(top.predRings or {}) do fn(c) end
 end
 local function hideTop() topAll(function(o) o.Visible = false end) end
@@ -430,6 +498,9 @@ local function hideAll()
     for _, c in ipairs(inBlastMarks) do c.Visible = false end
     inBlastText.Visible = false
     targetText.Visible, targetLine.Visible = false, false
+    aimMark.Visible, aimCrossH.Visible, aimCrossV.Visible, aimAltMark.Visible, aimText.Visible = false, false, false, false, false
+    for _, l in ipairs(moveRing) do l.Visible = false end
+    moveLine.Visible, moveText.Visible = false, false
     hidePanel()
     hideTop()
 end
@@ -588,7 +659,7 @@ local function stepMapBuild()
     if not map.building then return end
     local budget = CONFIG.MapScanPerFrame
     local tEnd = now() + CONFIG.MapMsPerFrame / 1000
-    while budget > 0 and map.qi <= map.qn and (budget % 25 ~= 0 or now() < tEnd) do
+    while budget > 0 and map.qi <= map.qn and (budget % 5 ~= 0 or now() < tEnd) do
         local inst = map.queue[map.qi]
         map.queue[map.qi] = nil
         map.qi = map.qi + 1
@@ -778,13 +849,10 @@ local arcAir, arcRollBurst, arcTimes, arcTickPts, arcAirHeight = nil, false, {},
 local arcBounces = {}
 local arcLandSrc = nil
 local arcProfile = nil
+local sideCols = { key = nil, k = 0, building = {}, done = nil, doneKey = nil } -- side-view slices being built
 
-local function simulate(camera, char)
-    verifyRaycast(char)
-    local origin, dir = launchFrame(camera, char)
-    local vel   = dir * CONFIG.ThrowSpeed + v3(0, CONFIG.ThrowSpeed * CONFIG.UpBias, 0)
-    local gStep = v3(0, -CONFIG.Gravity * CONFIG.TimeStep, 0)
-
+-- ground height to use when no map part is hit (a far-away placeholder once the map is loaded)
+local function currentGroundY(char, origin)
     local root = char:FindFirstChild("HumanoidRootPart")
     local groundY = root and (root.Position.Y - CONFIG.FallbackGroundDrop) or (origin.Y - 5)
     if map.ready and map.n > 0 then
@@ -798,15 +866,20 @@ local function simulate(camera, char)
         table.sort(arr)
         groundY = arr[math.floor((#arr + 1) / 2)]
     end
+    return groundY
+end
 
-    -- exact parabola p(t) = origin + v*t - g*t^2/2 (no step-by-step drift)
-    local g = CONFIG.Gravity
-    local function at(t) return origin + vel * t + v3(0, -0.5 * g * t * t, 0) end
-    -- how long it can fly before the fuse runs out
+-- seconds the grenade can fly before it explodes, if thrown now
+local function currentFuse()
     local fuseLeft = CONFIG.Fuse
     if CONFIG.FuseStart == "Pin" and hold.pinT then fuseLeft = CONFIG.Fuse - (now() - hold.pinT) end
-    local flightBudget = fuseLeft - CONFIG.LaunchDelay
+    return fuseLeft, fuseLeft - CONFIG.LaunchDelay
+end
 
+-- the whole flight from a launch point and velocity: parabolas, wall bounces, landing, roll, fuse.
+-- No side effects, so the aim solver can try many directions with it.
+local function flyGrenade(origin, vel, char, groundY, flightBudget)
+    local g = CONFIG.Gravity
     -- the flight is a chain of parabolas: a new one starts at every wall bounce
     local segs = { { o = origin, v = vel, t0 = 0 } }
     local cur = segs[1]
@@ -857,10 +930,9 @@ local function simulate(camera, char)
             if cur.t0 + tau > CONFIG.Steps * dt then break end
         end
     end
-    vel = vImpact -- velocity at impact
     local restPos, rollBurst = nil, false
     if landPos and CONFIG.PredictRoll and landFloor then
-        local vh = v3(vel.X, 0, vel.Z)
+        local vh = v3(vImpact.X, 0, vImpact.Z)
         local sp = vh.Magnitude * CONFIG.BounceKeep
         if sp > 0.5 then
             local f = CONFIG.RollFriction
@@ -878,6 +950,24 @@ local function simulate(camera, char)
             if wallHit then restPos = wallHit - lift end
         end
     end
+    return { pts = pts, landPos = landPos, landFloor = landFloor, tHit = tHit, tPrev = tPrev, airburst = airburst,
+             vImpact = vImpact, bouncePts = bouncePts, segs = segs, cur = cur, landSrc = landSrc,
+             restPos = restPos, rollBurst = rollBurst, final = airburst or restPos or landPos }
+end
+
+local function simulate(camera, char)
+    verifyRaycast(char)
+    local origin, dir = launchFrame(camera, char)
+    local vel   = dir * CONFIG.ThrowSpeed + v3(0, CONFIG.ThrowSpeed * CONFIG.UpBias, 0)
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local groundY = currentGroundY(char, origin)
+    local g = CONFIG.Gravity
+    local fuseLeft, flightBudget = currentFuse()
+    local F = flyGrenade(origin, vel, char, groundY, flightBudget)
+    local pts, landPos, landFloor, tHit, tPrev, airburst = F.pts, F.landPos, F.landFloor, F.tHit, F.tPrev, F.airburst
+    local bouncePts, segs, cur, landSrc, restPos, rollBurst = F.bouncePts, F.segs, F.cur, F.landSrc, F.restPos, F.rollBurst
+    local function segAt(s, tau) return s.o + s.v * tau + v3(0, -0.5 * g * tau * tau, 0) end
+    vel = F.vImpact -- velocity at impact
     arcPts, arcLand, arcRoot, arcRest = pts, landPos, root and root.Position, restPos
     arcAir, arcRollBurst = airburst, rollBurst
     arcLandSrc = landSrc
@@ -924,17 +1014,33 @@ local function simulate(camera, char)
         local maxD = arc2[#arc2][1]
         if restPos then maxD = math.max(maxD, along(restPos)) end
         maxD = math.max(maxD + 10, 20)
-        local cols = {}
+        -- building slices along the throw line: reused while the aim barely moves, and otherwise
+        -- rebuilt a few slices per update (a full rebuild at once caused frame spikes on dense maps)
+        local cols = sideCols.done or {}
         if map.ready or map.n > 0 then
             local N = math.max(10, math.floor(CONFIG.SideColumns))
-            for k = 1, N do
-                local d = maxD * k / N
-                local x, z = o.X + hd.X * d, o.Z + hd.Z * d
-                local spans = columnSpans(x, z, maxY + 40, minY - 10, maxD / N * 0.55)
-                for _, sp in ipairs(spans) do
+            local key = string.format("%d|%d|%d|%d|%d|%d", math.floor(o.X), math.floor(o.Z),
+                math.floor(hd.X * 200), math.floor(hd.Z * 200), math.floor(maxD / 4), N)
+            if key ~= sideCols.doneKey then
+                if key ~= sideCols.key then
+                    sideCols.key, sideCols.k, sideCols.building = key, 0, {}
+                end
+                local stopAt = math.min(N, sideCols.k + 20)
+                for k = sideCols.k + 1, stopAt do
+                    local d = maxD * k / N
+                    local x, z = o.X + hd.X * d, o.Z + hd.Z * d
+                    sideCols.building[k] = { d, columnSpans(x, z, maxY + 40, minY - 10, maxD / N * 0.55) }
+                end
+                sideCols.k = stopAt
+                if stopAt >= N then
+                    sideCols.done, sideCols.doneKey = sideCols.building, key
+                    cols = sideCols.done
+                end
+            end
+            for _, col in ipairs(cols) do
+                for _, sp in ipairs(col[2]) do
                     if sp[2] > maxY then maxY = math.min(sp[2], maxY + 40) end
                 end
-                cols[#cols + 1] = { d, spans }
             end
         end
         arcProfile = { arc = arc2, cols = cols, maxD = maxD, minY = minY - 3, maxY = maxY + 5, groundY = shownGround,
@@ -1120,6 +1226,370 @@ local function evalTarget(landPos)
     return best
 end
 
+-- ---------- aim helper ----------
+-- Tries many pitch angles toward the target with the full model (fuse, bounces, roll, map) and keeps
+-- the direction whose blast lands closest to where the target will be. Both a low throw and a lob are
+-- considered; the closer one wins (a lob is offered as the alternative when it also works).
+local aim = { dir = nil, err = nil, alt = nil, reachable = false, msg = nil, name = nil, t = -1 }
+
+local function pickAimTarget(camera)
+    if currentTarget then return currentTarget end
+    -- nobody near the blast: the person closest to where you're looking (sideways angle)
+    local cf = camera.CFrame
+    local look = v3(cf.LookVector.X, 0, cf.LookVector.Z)
+    if look.Magnitude < 0.01 then return nil end
+    look = look.Unit
+    local best, bestA = nil, math.rad(CONFIG.AimPickAngle)
+    for _, h in ipairs(humanoids) do
+        local ok, pos = pcall(function() return h.root.Position end)
+        if ok and pos then
+            local pr = CONFIG.PredictMovement and predictions[h.name] or nil
+            local pp = pr and pr.pos or pos
+            local d = v3(pp.X - cf.Position.X, 0, pp.Z - cf.Position.Z)
+            if d.Magnitude > 5 then
+                local a = math.acos(clamp(dot(d.Unit, look), -1, 1))
+                if a < bestA then best, bestA = { name = h.name, ppos = pp, pos = pos }, a end
+            end
+        end
+    end
+    return best
+end
+
+local aimTries = 0
+local function aimPause()
+    aimTries = aimTries + 1
+    if aimTries % math.max(1, CONFIG.AimTriesPerFrame) == 0 then
+        local canYield = false
+        if coroutine.isyieldable then canYield = coroutine.isyieldable() else canYield = coroutine.running() ~= nil end
+        if canYield then coroutine.yield() end
+    end
+end
+
+-- how far a landing is from the target: distance from the blast to the nearest part of their body
+-- (their root sits ~3 studs above their feet), plus a full radius if a wall/roof shields them
+local function landErr(fin, T, vel)
+    local R = CONFIG.BlastRadius + 1.5
+    local dy = math.max(0, math.abs(fin.Y - T.Y) - 3)
+    local err = math.sqrt((fin.X - T.X) ^ 2 + (fin.Z - T.Z) ^ 2 + dy * dy)
+    if err <= R and CONFIG.BlastNeedsLineOfSight and map.ready then
+        local fl = v3(vel.X, 0, vel.Z)
+        local c = fin + v3(0, 1, 0) - (fl.Magnitude > 0.01 and fl.Unit * 0.3 or v3(0, 0, 0))
+        if mapHit(c, T) and mapHit(c, T + v3(0, 1.5, 0)) then err = err + R end
+    end
+    return err
+end
+
+-- the best throw from a head position toward T. The aim helper and the move helper both use this,
+-- so "blast would land N studs" from a spot is what the aim helper will really find once you're there.
+-- quick = a cheaper sweep used to screen many spots
+local function solveFrom(head, char, T, groundY, flightBudget, pause, quick)
+    local up = v3(0, 1, 0)
+    local R = CONFIG.BlastRadius + 1.5
+    local toT = v3(T.X - head.X, 0, T.Z - head.Z)
+    if toT.Magnitude < 1 then return nil end
+    local yawDir0 = toT.Unit
+    local function tryDir(yawDir, pitch)
+        pause()
+        local dir = yawDir * math.cos(pitch) + up * math.sin(pitch)
+        local origin = head + dir * CONFIG.SpawnForward + CONFIG.OriginShift
+        local vel = dir * CONFIG.ThrowSpeed + up * (CONFIG.ThrowSpeed * CONFIG.UpBias)
+        -- pressed against a wall, the grenade would start on the other side of it: never count those
+        if map.ready and mapHit(head, origin) then return math.huge, dir, nil end
+        local F = flyGrenade(origin, vel, char, groundY, flightBudget)
+        local fin = F.final
+        if not fin then return math.huge, dir, nil end
+        return landErr(fin, T, vel), dir, fin
+    end
+    local maxReach = 0
+    local step = quick and 8 or 3
+    local samples = {}
+    for deg = (quick and -45 or -60), 85, step do
+        local p = math.rad(deg)
+        local err, _, fin = tryDir(yawDir0, p)
+        if fin then maxReach = math.max(maxReach, v3(fin.X - head.X, 0, fin.Z - head.Z).Magnitude) end
+        samples[#samples + 1] = { err = err, p = p, deg = deg }
+    end
+    -- best local minima of the sweep (narrow gaps like windows give a sharp dip, keep several)
+    local mins = {}
+    for i, c in ipairs(samples) do
+        local l, r = samples[i - 1], samples[i + 1]
+        if c.err < math.huge and (not l or c.err <= l.err) and (not r or c.err <= r.err) then mins[#mins + 1] = c end
+    end
+    table.sort(mins, function(a, b) return a.err < b.err end)
+    local function refine(c)
+        if not c then return nil end
+        local a, b = c.p - math.rad(step), c.p + math.rad(step)
+        local gr = 0.618
+        local x1, x2 = b - gr * (b - a), a + gr * (b - a)
+        local f1, f2 = tryDir(yawDir0, x1), tryDir(yawDir0, x2)
+        for _ = 1, (quick and 4 or 8) do
+            if f1 < f2 then b, x2, f2 = x2, x1, f1 x1 = b - gr * (b - a) f1 = tryDir(yawDir0, x1)
+            else a, x1, f1 = x1, x2, f2 x2 = a + gr * (b - a) f2 = tryDir(yawDir0, x2) end
+        end
+        local p = (a + b) / 2
+        local err, dir, fin = tryDir(yawDir0, p)
+        if c.err < err then -- the sweep sample itself was better (narrow window)
+            err, dir, fin = tryDir(yawDir0, c.p) p = c.p
+        end
+        if fin and not quick then
+            -- turn a little to cancel any sideways error (bounces/roll), keep whichever is better
+            local right = v3(-yawDir0.Z, 0, yawDir0.X)
+            local side = dot(fin - T, right)
+            local dist = v3(fin.X - head.X, 0, fin.Z - head.Z).Magnitude
+            if math.abs(side) > 0.5 and dist > 1 then
+                local turn = -math.atan(side / dist)
+                local yaw2 = (yawDir0 * math.cos(turn) + right * math.sin(turn)).Unit
+                local err2, dir2, fin2 = tryDir(yaw2, p)
+                if err2 < err then err, dir, fin = err2, dir2, fin2 end
+            end
+        end
+        return { err = err, dir = dir, fin = fin, p = p }
+    end
+    -- refine the best dips (quick: just the best one); keep a lob/low alternative ~10+ deg apart
+    local best, other = nil, nil
+    for i = 1, math.min(#mins, quick and 1 or 3) do
+        local r = refine(mins[i])
+        if r and r.fin then
+            if not best or r.err < best.err then
+                if best and math.abs(best.p - r.p) > math.rad(10) then other = best end
+                best = r
+            elseif math.abs(best.p - r.p) > math.rad(10) and (not other or r.err < other.err) then
+                other = r
+            end
+        end
+    end
+    if not best or not best.fin then return { err = math.huge, maxReach = maxReach, toT = toT } end
+    best.other, best.maxReach, best.toT = other, maxReach, toT
+    return best
+end
+
+local function solveAim(camera, char, tgt)
+    local aim = { dir = nil, err = nil, alt = nil, reachable = false, msg = nil, name = nil }
+    if not tgt then return aim end
+    aim.name = tgt.name
+    local T = tgt.ppos
+    local head = anchorPosition(char, camera)
+    local groundY = currentGroundY(char, head)
+    local _, flightBudget = currentFuse()
+    local R = CONFIG.BlastRadius + 1.5
+    local best = solveFrom(head, char, T, groundY, flightBudget, aimPause, false)
+    if not best then return aim end
+    if not best.fin then
+        aim.msg = "no throw reaches " .. tgt.name
+        return aim
+    end
+    local other = best.other
+    aim.dir, aim.err, aim.final = best.dir, best.err, best.fin
+    aim.reachable = best.err <= R
+    if other and other.fin and other.err <= R and math.abs(other.p - best.p) > math.rad(10) then aim.alt = other.dir end
+    if not aim.reachable then
+        local need = best.toT.Magnitude - best.maxReach
+        if need > 2 then
+            aim.msg = string.format("%s is out of reach - move about %d studs closer", tgt.name, math.ceil(need + 3))
+        else
+            aim.msg = string.format("best throw still misses %s by %d studs", tgt.name, math.ceil(best.err - R))
+        end
+    end
+    return aim
+end
+
+-- runs solveAim a few test throws per frame; the shown answer only changes when a solve finishes
+local move = { spot = nil, err = nil, from = nil, name = nil, job = nil }
+local function searchMove(char, tgt, curErr)
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local head = char:FindFirstChild("Head")
+    if not root or not head then return nil end
+    local rootP = root.Position
+    local headOff = head.Position - rootP -- launch point relative to your root (same as now, moved)
+    local T = tgt.ppos
+    local _, flightBudget = currentFuse()
+    local R = CONFIG.BlastRadius + 1.5
+    local hasMap = map.ready and map.n > 0
+    local toT = v3(T.X - rootP.X, 0, T.Z - rootP.Z)
+    local tries = 0
+    local per = math.max(1, CONFIG.MoveTriesPerFrame)
+    local function pause()
+        tries = tries + 1
+        if tries % per == 0 then
+            local canYield = false
+            if coroutine.isyieldable then canYield = coroutine.isyieldable() else canYield = coroutine.running() ~= nil end
+            if canYield then coroutine.yield() end
+        end
+    end
+    local dirs = {}
+    local n = math.max(4, math.floor(CONFIG.MoveDirections))
+    for i = 0, n - 1 do
+        local a = i / n * math.pi * 2
+        dirs[#dirs + 1] = v3(math.cos(a), 0, math.sin(a))
+    end
+    if toT.Magnitude > 1 then dirs[#dirs + 1] = toT.Unit end
+
+    -- where you are now, with the exact same solver the aim helper uses
+    local hereGround = hasMap and -1e6 or (rootP.Y - 3)
+    local here = solveFrom(head.Position, char, T, hereGround, flightBudget, pause, false)
+    local hereErr = here and here.err or math.huge
+    if not CONFIG.MoveAlways and hereErr <= CONFIG.MoveWhenOffBy then return { here = hereErr, hereP = here and here.p } end
+    if hereErr <= 0.75 then return { here = hereErr, hereP = here and here.p } end -- can't do better than this
+
+    -- candidate spots: rings around you, straight toward the target, rings around the target, last suggestion
+    local cands = {}
+    local function add(spot, walk, sticky)
+        cands[#cands + 1] = { spot = spot, walk = walk, sticky = sticky }
+    end
+    for _, r in ipairs(CONFIG.MoveRadii) do
+        for _, d in ipairs(dirs) do add(rootP + d * r, r) end
+    end
+    local flat = toT.Magnitude
+    if flat > 1 and hereErr > R then
+        for _, k in ipairs({ 0.6, 0.85, 1.05 }) do
+            local r = math.min(flat - 2, (hereErr - R * 0.5) * k + 5)
+            if r > CONFIG.MoveRadii[#CONFIG.MoveRadii] then add(rootP + toT.Unit * r, r) end
+        end
+    end
+    for _, tr in ipairs(CONFIG.MoveAroundTarget or {}) do
+        for i = 1, n do
+            local d = dirs[i]
+            local spot = v3(T.X, rootP.Y, T.Z) + d * tr
+            local w = (spot - rootP).Magnitude
+            if w > 8 and w <= CONFIG.MoveMaxWalk then add(spot, w) end
+        end
+    end
+    -- can't see them from here (inside a building, behind a wall)? then look for spots that can:
+    -- shoot sight lines out from the target and stand where one comes out (doors, windows, gaps)
+    local tChest = T + v3(0, 1.5, 0)
+    if hasMap and mapHit(head.Position, tChest) and mapHit(head.Position, T) then
+        local nd = math.max(8, math.floor(CONFIG.MoveSightDirs or 24))
+        for i = 0, nd - 1 do
+            local a = i / nd * math.pi * 2
+            local d = v3(math.cos(a), 0, math.sin(a))
+            for _, dist in ipairs(CONFIG.MoveSightDist or { 20, 35, 50, 70 }) do
+                local spot = v3(T.X, rootP.Y, T.Z) + d * dist
+                local w = (spot - rootP).Magnitude
+                if w <= CONFIG.MoveMaxWalk then
+                    pause()
+                    local eye = spot + v3(0, headOff.Y, 0)
+                    if not mapHit(eye, tChest) or not mapHit(eye, T) then add(spot, w) break end -- nearest one per direction
+                end
+            end
+        end
+    end
+    if move.spot and move.name == tgt.name then
+        add(v3(move.spot.X, rootP.Y, move.spot.Z), (v3(move.spot.X, rootP.Y, move.spot.Z) - rootP).Magnitude, true)
+    end
+
+    -- stage 1: drop spots you can't stand on / walk straight to, quick-score the rest
+    local screened = {}
+    for _, c in ipairs(cands) do
+        local spot = c.spot
+        pause() pause()
+        -- floor near your own height (casting from far above would put you on roofs)
+        local floorHit = mapHit(v3(spot.X, rootP.Y + 6, spot.Z), v3(spot.X, rootP.Y - 40, spot.Z))
+        local okStand = floorHit ~= nil or not hasMap
+        local blocked = hasMap and mapHit(rootP, v3(spot.X, rootP.Y, spot.Z)) ~= nil
+        local feet = floorHit and floorHit.Y or (rootP.Y - 3)
+        if okStand and not blocked and hasMap then
+            -- room to stand: nothing within ~2.5 studs at chest height
+            local chest = v3(spot.X, feet + 3, spot.Z)
+            for _, o in ipairs({ v3(2.5, 0, 0), v3(-2.5, 0, 0), v3(0, 0, 2.5), v3(0, 0, -2.5) }) do
+                if mapHit(chest, chest + o) then blocked = true break end
+            end
+            if not blocked and mapHit(chest, chest + v3(0, 3.5, 0)) then blocked = true end -- no headroom
+        end
+        if okStand and not blocked then
+            c.feet = feet
+            c.head = v3(spot.X, feet + 3, spot.Z) + headOff
+            c.ground = hasMap and -1e6 or feet
+            local q = solveFrom(c.head, char, T, c.ground, flightBudget, pause, true)
+            if q and q.fin then
+                c.q = q.err
+                c.score = q.err + c.walk * 0.04 - (c.sticky and 1 or 0)
+                screened[#screened + 1] = c
+            end
+        end
+    end
+    table.sort(screened, function(a, b) return a.score < b.score end)
+
+    -- stage 2: the best few get the full solve (what the aim helper will really get there)
+    local best = nil
+    for i = 1, math.min(#screened, math.max(1, CONFIG.MoveFinalists)) do
+        local c = screened[i]
+        local f = solveFrom(c.head, char, T, c.ground, flightBudget, pause, false)
+        if f and f.fin then
+            local score = f.err + c.walk * 0.04 - (c.sticky and 1 or 0)
+            if f.err < hereErr - CONFIG.MoveMinGain and (not best or score < best.score) then
+                best = { spot = v3(c.spot.X, c.feet, c.spot.Z), err = f.err, score = score, walk = c.walk, p = f.p }
+            end
+        end
+    end
+    local res = best or {}
+    res.here, res.hereP = hereErr, here and here.p
+    return res
+end
+
+local function stepMoveSearch(char, tgt, curErr)
+    if not move.job then
+        if not tgt or not due("moveSearch", 1 / math.max(CONFIG.MoveEveryS, 0.2)) then return end
+        if coroutine and coroutine.create then
+            move.job = coroutine.create(function() return searchMove(char, tgt, curErr) end)
+            move.jobName = tgt.name
+        else
+            local ok, res = pcall(searchMove, char, tgt, curErr)
+            move.spot, move.err, move.name = ok and res and res.spot, ok and res and res.err, tgt.name
+            move.here, move.done = ok and res and res.here, ok
+            move.p, move.hereP = ok and res and res.p, ok and res and res.hereP
+            return
+        end
+    end
+    local ok, res = coroutine.resume(move.job)
+    if not ok then move.job = nil return end
+    if coroutine.status(move.job) == "dead" then
+        move.job = nil
+        move.spot, move.err, move.name = res and res.spot or nil, res and res.err or nil, move.jobName
+        move.here, move.done = res and res.here or nil, res ~= nil
+        move.p, move.hereP = res and res.p or nil, res and res.hereP or nil
+        if CONFIG.Debug and res then
+            local key = res.spot and string.format("%d,%d", math.floor(res.spot.X / 4), math.floor(res.spot.Z / 4)) or "stay"
+            if key ~= move.lastKey then
+                move.lastKey = key
+                if res.spot then
+                    print(string.format("[Trajectory] move helper: best spot (%.0f, %.0f, %.0f) %d studs away -> blast %.1f studs from %s (from here: %.1f), aim %.0f deg",
+                        res.spot.X, res.spot.Y, res.spot.Z, math.floor(res.walk or 0), res.err, move.jobName or "?", res.here or -1, math.deg(res.p or 0)))
+                else
+                    print(string.format("[Trajectory] move helper: stay - best from here is %.1f studs from %s", res.here or -1, move.jobName or "?"))
+                end
+            end
+        end
+    end
+end
+
+local aimJob = nil
+local function stepAimSolver(camera, char, tgt)
+    if not aimJob then
+        if not tgt or not due("aimSolve", CONFIG.AimHz) then return end
+        if coroutine and coroutine.create then
+            aimJob = coroutine.create(function() return solveAim(camera, char, tgt) end)
+        else
+            local ok, res = pcall(solveAim, camera, char, tgt) -- no coroutines: solve in one go
+            if ok and res then for k, v in pairs(res) do aim[k] = v end aim.dir = res.dir aim.alt = res.alt aim.msg = res.msg end
+            return
+        end
+    end
+    local ok, res = coroutine.resume(aimJob)
+    if not ok then aimJob = nil return end
+    if coroutine.status(aimJob) == "dead" then
+        aimJob = nil
+        if res then
+            aim.dir, aim.err, aim.alt, aim.reachable, aim.msg, aim.name, aim.final =
+                res.dir, res.err, res.alt, res.reachable, res.msg, res.name, res.final
+        end
+    end
+end
+
+local atan2 = math.atan2 or math.atan -- (Luau has atan2; plain Lua 5.3+ uses atan(y, x))
+local function yawPitch(d)
+    return atan2(-d.X, -d.Z), math.asin(clamp(d.Y, -1, 1))
+end
+
 local function targetHint(t)
     local parts = {}
     if math.abs(t.fwd) >= 2 then parts[#parts + 1] = string.format("%d %s", math.floor(math.abs(t.fwd) + 0.5), t.fwd > 0 and "further" or "shorter") end
@@ -1134,7 +1604,7 @@ local function drawInBlast(landPos)
     if landPos and CONFIG.ShowInBlast then
         if now() - humanoidsT > 1 / CONFIG.InBlastScanHz then
             humanoidsT = now()
-            pcall(refreshHumanoids)
+            pcall(timed, "people scan", refreshHumanoids)
         end
         local R = CONFIG.BlastRadius
         local inside = {}
@@ -1389,6 +1859,11 @@ local function drawTop(camera, fin, color)
     end
     for i = pi + 1, #top.people do top.people[i].Visible = false top.names[i].Visible = false end
 
+    -- where to move to (from the "move here" helper)
+    if top.moveDot then
+        if move.spot and moveText.Visible then dotAt(top.moveDot, move.spot.X, move.spot.Z) else top.moveDot.Visible = false end
+    end
+
     -- line from the blast to the target, colored hit / miss
     if top.targetLine then
         local t = currentTarget
@@ -1554,6 +2029,155 @@ local function draw(camera)
     else
         targetText.Visible, targetLine.Visible = false, false
     end
+
+    -- aim helper: where to point the crosshair so the blast lands on the target
+    local aimShown = false
+    if CONFIG.AimAssist then
+        local tgtA = pickAimTarget(camera)
+        if tgtA or aimJob then
+            pcall(stepAimSolver, camera, LocalPlayer.Character, tgtA)
+        end
+        if not tgtA and not aimJob then
+            aim.dir, aim.msg, aim.alt = nil, nil, nil
+        end
+        local okV, vp = pcall(function() return camera.ViewportSize end)
+        local W, H = 1920, 1080
+        if okV and vp then W, H = vp.X, vp.Y end
+        local hint = nil
+        if aim.dir then
+            local cy, cp = yawPitch(look)
+            local ay, ap = yawPitch(aim.dir)
+            local dyaw = math.deg(ay - cy)
+            dyaw = (dyaw + 180) % 360 - 180
+            local dpitch = math.deg(ap - cp)
+            local mcol = aim.reachable and CONFIG.ColorHit or CONFIG.ColorMiss
+            if math.abs(dyaw) < CONFIG.AimOnTargetDeg and math.abs(dpitch) < CONFIG.AimOnTargetDeg then
+                hint = aim.reachable and ("ON TARGET - throw now (" .. aim.name .. ")") or ("as close as it gets - " .. (aim.msg or ""))
+            else
+                local parts = {}
+                if math.abs(dpitch) >= 0.1 then parts[#parts + 1] = string.format("%.1f deg %s", math.abs(dpitch), dpitch > 0 and "up" or "down") end
+                if math.abs(dyaw) >= 0.1 then parts[#parts + 1] = string.format("%.1f deg %s", math.abs(dyaw), dyaw > 0 and "left" or "right") end
+                hint = "aim " .. table.concat(parts, ", ") .. " for " .. aim.name
+                if not aim.reachable and aim.msg then hint = hint .. "  (" .. aim.msg .. ")" end
+            end
+            -- marker where the crosshair should go (a point far along the aim direction)
+            local p = cf.Position + aim.dir * 300
+            local s, on = WorldToScreen(p)
+            if on and dot(p - camPos, look) > NEAR then
+                aimMark.Position, aimMark.Color, aimMark.Visible = s, mcol, true
+                aimCrossH.From, aimCrossH.To, aimCrossH.Color, aimCrossH.Visible = Vector2.new(s.X - 14, s.Y), Vector2.new(s.X + 14, s.Y), mcol, true
+                aimCrossV.From, aimCrossV.To, aimCrossV.Color, aimCrossV.Visible = Vector2.new(s.X, s.Y - 14), Vector2.new(s.X, s.Y + 14), mcol, true
+            else
+                aimMark.Visible, aimCrossH.Visible, aimCrossV.Visible = false, false, false
+            end
+            if aim.alt then
+                local p2 = cf.Position + aim.alt * 300
+                local s2, on2 = WorldToScreen(p2)
+                if on2 and dot(p2 - camPos, look) > NEAR then aimAltMark.Position, aimAltMark.Color, aimAltMark.Visible = s2, mcol, true
+                else aimAltMark.Visible = false end
+            else
+                aimAltMark.Visible = false
+            end
+            aimText.Color = mcol
+        elseif aim.msg then
+            hint = aim.msg
+            aimText.Color = CONFIG.ColorMiss
+            aimMark.Visible, aimCrossH.Visible, aimCrossV.Visible, aimAltMark.Visible = false, false, false, false
+        else
+            aimMark.Visible, aimCrossH.Visible, aimCrossV.Visible, aimAltMark.Visible = false, false, false, false
+        end
+        if hint then
+            aimText.Text = hint
+            aimText.Position, aimText.Visible = Vector2.new(W * CONFIG.AimHudPos.X, H * CONFIG.AimHudPos.Y), true
+            aimShown = true
+        end
+    end
+    -- "move here": whenever a target is picked up (or, with MoveAlways off, only when the throw from here is off)
+    local moveShown = false
+    if CONFIG.MoveHelper and CONFIG.AimAssist then
+        local tgtM = pickAimTarget(camera)
+        local need = tgtM and aim.err and aim.name == tgtM.name and (CONFIG.MoveAlways or aim.err > CONFIG.MoveWhenOffBy)
+        if tgtM and move.name and move.name ~= tgtM.name and not move.job then
+            move.spot, move.done, move.here, move.name = nil, false, nil, nil -- new target: forget the old answer
+        end
+        if need or move.job then
+            pcall(stepMoveSearch, LocalPlayer.Character, tgtM, aim.err or math.huge)
+        end
+        if not need then move.spot, move.done = nil, false end
+        local okV, vp = pcall(function() return camera.ViewportSize end)
+        local W, H = 1920, 1080
+        if okV and vp then W, H = vp.X, vp.Y end
+        if need and not move.spot and move.name == tgtM.name and (move.done or move.job) then
+            -- nowhere nearby beats where you are (or still looking)
+            local R = CONFIG.BlastRadius + 1.5
+            local here = move.here or aim.err
+            if move.done then
+                local hn = math.floor(here + 0.5)
+                moveText.Text = hn == 0 and ("STAY - best spot (blast lands right on " .. tgtM.name .. ")")
+                    or here <= R and string.format("STAY - best spot (blast lands %d stud%s from %s)", hn, hn == 1 and "" or "s", tgtM.name)
+                    or string.format("no better spot nearby for %s", tgtM.name)
+            else
+                moveText.Text = "finding the best spot for " .. tgtM.name .. "..."
+            end
+            moveText.Color = CONFIG.ColorMove
+            moveText.Position, moveText.Visible = Vector2.new(W * CONFIG.MoveHudPos.X, H * CONFIG.MoveHudPos.Y), true
+            moveLine.Visible = false
+            for _, l in ipairs(moveRing) do l.Visible = false end
+            moveShown = "text"
+        end
+        if need and move.spot and move.name == tgtM.name then
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local rp = root.Position
+                local fwd = v3(look.X, 0, look.Z)
+                fwd = fwd.Magnitude > 0.01 and fwd.Unit or v3(0, 0, -1)
+                local rt = v3(-fwd.Z, 0, fwd.X)
+                local dlt = move.spot - rp
+                local f, r = dot(dlt, fwd), dot(dlt, rt)
+                local parts = {}
+                if math.abs(f) >= 2 then parts[#parts + 1] = string.format("%d studs %s", math.floor(math.abs(f) + 0.5), f > 0 and "forward" or "back") end
+                if math.abs(r) >= 2 then parts[#parts + 1] = string.format("%d studs %s", math.floor(math.abs(r) + 0.5), r > 0 and "right" or "left") end
+                local R = CONFIG.BlastRadius + 1.5
+                local mn = math.floor(move.err + 0.5)
+                local result = mn == 0 and ("blast would land right on " .. move.name)
+                    or move.err <= R and string.format("blast would land %d stud%s from %s", mn, mn == 1 and "" or "s", move.name)
+                    or string.format("still %d studs short of %s, but closer", math.ceil(move.err - R), move.name)
+                local aimTxt = ""
+                if move.p then
+                    local d = math.floor(math.deg(move.p) + 0.5)
+                    aimTxt = d >= 1 and string.format(", then aim %d deg up", d) or d <= -1 and string.format(", then aim %d deg down", -d) or ", then aim level"
+                end
+                moveText.Text = "MOVE " .. (#parts > 0 and table.concat(parts, ", ") or "a step") .. aimTxt .. " - " .. result
+                moveText.Color = CONFIG.ColorMove
+                moveText.Position, moveText.Visible = Vector2.new(W * CONFIG.MoveHudPos.X, H * CONFIG.MoveHudPos.Y), true
+                -- ring on the ground at the spot + a line from your feet
+                local c = move.spot + v3(0, 0.2, 0)
+                local prev = c + v3(2, 0, 0)
+                for i, l in ipairs(moveRing) do
+                    local a = i / #moveRing * math.pi * 2
+                    local p = c + v3(math.cos(a) * 2, 0, math.sin(a) * 2)
+                    local sa, sb = projectSegment(prev, p, camPos, look)
+                    if sa then l.From, l.To, l.Color, l.Visible = sa, sb, CONFIG.ColorMove, true else l.Visible = false end
+                    prev = p
+                end
+                local sa, sb = projectSegment(rp - v3(0, 2.8, 0), c, camPos, look)
+                if sa then moveLine.From, moveLine.To, moveLine.Color, moveLine.Visible = sa, sb, CONFIG.ColorMove, true
+                else moveLine.Visible = false end
+                moveShown = true
+            end
+        end
+    end
+    if not moveShown then
+        moveText.Visible, moveLine.Visible = false, false
+        for _, l in ipairs(moveRing) do l.Visible = false end
+    end
+
+    if not aimShown then
+        aimText.Visible = false
+        aimMark.Visible, aimCrossH.Visible, aimCrossV.Visible, aimAltMark.Visible = false, false, false, false
+    end
+
     if #arcBounces > 0 then
         text = text .. (#arcBounces == 1 and "  |  bounces off a wall" or string.format("  |  bounces off %d walls", #arcBounces))
     end
@@ -1665,8 +2289,8 @@ local function draw(camera)
 end
 
 local function update(camera, char, fresh)
-    if fresh or due("physics", CONFIG.PhysicsHz) then simulate(camera, char) end
-    if fresh or due("draw", CONFIG.DrawHz) then draw(camera) end
+    if fresh or due("physics", CONFIG.PhysicsHz) then timed("arc physics", simulate, camera, char) end
+    if fresh or due("draw", CONFIG.DrawHz) then timed("drawing", draw, camera) end
 end
 
 -- ---------- flight logger ----------
@@ -2383,7 +3007,8 @@ local PRESETS = {
                SidePanel = false, TopPanel = true, ArcTicks = false, PredictMovement = true, InBlastScanHz = 1,
                WatchHz = 10, MapMsPerFrame = 3 },
     Potato = { PhysicsHz = 6, DrawHz = 20, PanelHz = 4, SideColumns = 20, TopMaxBoxes = 12, BlastSegments = 16,
-               SidePanel = false, TopPanel = false, ArcTicks = false, PredictMovement = false, InBlastScanHz = 1,
+               SidePanel = false, TopPanel = false, ArcTicks = false, PredictMovement = false, InBlastScanHz = 1, AimHz = 1,
+               MoveHelper = false,
                WatchHz = 8, MapMsPerFrame = 2, Debug = false, LogThrows = false },
 }
 local PRESET_ORDER = { "High", "Medium", "Low", "Potato" }
@@ -2396,6 +3021,9 @@ local MENU_ITEMS = {
     { label = "People in blast",     kind = "bool", key = "ShowInBlast" },
     { label = "Movement prediction", kind = "bool", key = "PredictMovement" },
     { label = "Target hit / miss",   kind = "bool", key = "TargetCheck" },
+    { label = "Aim helper",          kind = "bool", key = "AimAssist" },
+    { label = "Move-here helper",    kind = "bool", key = "MoveHelper" },
+    { label = "Move hint always",    kind = "bool", key = "MoveAlways" },
     { label = "Arc depth ticks",     kind = "bool", key = "ArcTicks" },
     { label = "Wall bounces",        kind = "bool", key = "WallBounce" },
     { label = "Map collision",       kind = "bool", key = "MapCollision" },
@@ -2411,7 +3039,7 @@ local MENU_ITEMS = {
     { label = "Save settings",       kind = "action", act = "save" },
     { label = "Close",               kind = "action", act = "close" },
 }
-local SAVED_KEYS = { "SidePanel", "TopPanel", "ShowBlastRadius", "ShowInBlast", "PredictMovement", "TargetCheck", "ArcTicks",
+local SAVED_KEYS = { "SidePanel", "TopPanel", "ShowBlastRadius", "ShowInBlast", "PredictMovement", "TargetCheck", "AimAssist", "AimHz", "MoveHelper", "MoveAlways", "ArcTicks",
     "WallBounce", "MapCollision", "PhysicsHz", "DrawHz", "PanelHz", "SideColumns", "TopMaxBoxes", "TopViewRange",
     "BlastSegments", "Debug", "LogThrows", "InBlastScanHz", "WatchHz", "MapMsPerFrame" }
 
@@ -2540,7 +3168,63 @@ end
 -- saved menu settings first, then the loader's _G.TrajectoryConfig on top (the loader wins)
 pcall(loadSettings)
 if type(_G.TrajectoryConfig) == "table" then
-    for k, v in pairs(_G.TrajectoryConfig) do if CONFIG[k] ~= nil then CONFIG[k] = v end end
+    for k, v in pairs(_G.TrajectoryConfig) do if CONFIG[k] ~= nil or k == "Preset" then CONFIG[k] = v end end
+end
+-- a preset picked in the loader: _G.TrajectoryConfig = { Preset = "Low" }
+if type(CONFIG.Preset) == "string" and PRESETS[CONFIG.Preset] then
+    for k, v in pairs(PRESETS[CONFIG.Preset]) do CONFIG[k] = v end
+    menu.preset = CONFIG.Preset
+    print("[Trajectory] using the " .. CONFIG.Preset .. " preset")
+end
+
+local function perfReport(reason)
+    local secs = perf.t0 and (now() - perf.t0) or 0
+    if secs <= 0 or perf.frames == 0 then return end
+    local parts = {}
+    local total = 0
+    for name, t in pairs(perf.acc) do total = total + t parts[#parts + 1] = { name, t } end
+    table.sort(parts, function(a, b) return a[2] > b[2] end)
+    local out = {}
+    for i = 1, math.min(#parts, 6) do
+        out[#out + 1] = string.format("%s %.1fms", parts[i][1], 1000 * parts[i][2] / perf.frames)
+    end
+    print(string.format("[Trajectory] perf%s: %.0f FPS | script %.1f ms per frame (%s)",
+        reason and (" (" .. reason .. ")") or "", perf.frames / secs, 1000 * total / perf.frames, table.concat(out, ", ")))
+end
+
+-- called every frame: tracks FPS, steps down a preset when it stays low
+local function stepPerf(visible)
+    local t = now()
+    if perf.frameStart then
+        local dt = t - perf.frameStart
+        perf.emaDt = perf.emaDt and (perf.emaDt * 0.9 + dt * 0.1) or dt
+    end
+    perf.frameStart = t
+    perf.t0 = perf.t0 or t
+    perf.frames = perf.frames + 1
+    if CONFIG.PerfReportKey and keyFired(CONFIG.PerfReportKey, false) then perfReport("P pressed") end
+    if t - perf.t0 >= 10 then
+        perf.acc, perf.t0, perf.frames = {}, t, 0
+    end
+    if CONFIG.AutoPerformance and perf.emaDt and visible then
+        local fps = 1 / math.max(perf.emaDt, 1e-3)
+        if fps < CONFIG.AutoPerfMinFps then
+            perf.lowSince = perf.lowSince or t
+            if t - perf.lowSince > 4 then
+                perf.lowSince = nil
+                local order = { High = "Medium", Medium = "Low", Low = "Potato", Custom = "Medium" }
+                local nextP = order[menu.preset]
+                if nextP then
+                    perfReport("low FPS")
+                    for k, v in pairs(PRESETS[nextP]) do CONFIG[k] = v end
+                    menu.preset = nextP
+                    print(string.format("[Trajectory] FPS was %.0f - switched to the %s preset (Right Shift to change)", fps, nextP))
+                end
+            end
+        else
+            perf.lowSince = nil
+        end
+    end
 end
 
 -- returns true while the menu is open (so the caller can keep drawing it)
@@ -2588,6 +3272,7 @@ local STANDARD_CHAR = { Head = true, Torso = true, HumanoidRootPart = true, Huma
 local stop -- defined at the bottom
 
 local function step()
+    pcall(stepPerf, visible)
     if CONFIG.UnloadKey and has("iskeypressed") then
         local ok, down = pcall(iskeypressed, CONFIG.UnloadKey)
         if ok and down then
@@ -2620,7 +3305,7 @@ local function step()
             local okB, errB = pcall(startMapBuild)
             if not okB then map.failed = true print("[Trajectory] map read failed: " .. tostring(errB)) end
         end
-        local okM, errM = pcall(stepMapBuild)
+        local okM, errM = pcall(timed, "map read", stepMapBuild)
         if not okM then map.building, map.failed = false, true print("[Trajectory] map read error: " .. tostring(errM)) end
     end
     local camera = Workspace.CurrentCamera
@@ -2692,7 +3377,7 @@ local function step()
     lastTool = tool
 
     if CONFIG.AutoCalibrate or CONFIG.LogThrows or CONFIG.ReportAccuracy then
-        local okW, errW = pcall(stepWatcher, tool ~= nil)
+        local okW, errW = pcall(timed, "grenade watch", stepWatcher, tool ~= nil)
         if not okW then watcher = nil print("[Trajectory] watcher error: " .. tostring(errW)) end
     end
     pcall(stepExplosions)
@@ -2749,6 +3434,9 @@ stop = function()
     for _, c in ipairs(inBlastMarks) do c:Remove() end
     inBlastText:Remove()
     targetText:Remove()
+    for _, l in ipairs(moveRing) do l:Remove() end
+    moveLine:Remove() moveText:Remove()
+    aimMark:Remove() aimCrossH:Remove() aimCrossV:Remove() aimAltMark:Remove() aimText:Remove()
     targetLine:Remove()
     label:Remove()
     removeMenu()
@@ -2756,7 +3444,7 @@ stop = function()
 end
 _G.stopTrajectory = stop
 
-print("[Trajectory] loaded (" .. CONFIG.ShowMode .. " mode). X = unload, R = reset calibration, Right Shift = settings.")
+print("[Trajectory] loaded (" .. CONFIG.ShowMode .. " mode). X = unload, R = reset calibration, Right Shift = settings, P = performance report.")
 do
     local okG, wg = pcall(function() return Workspace.Gravity end)
     print("[Trajectory] game gravity (Workspace.Gravity) = " .. (okG and tostring(wg) or "unreadable"))
